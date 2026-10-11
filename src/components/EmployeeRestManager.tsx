@@ -1,38 +1,46 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Employee,
   ActiveRestSession,
   RestLogEntry,
   RestSettings,
-  SoundType,
 } from '../types';
-import { SOUND_OPTIONS } from '../data/presets';
 import { soundEngine } from '../utils/soundEngine';
-import { nativeAlarmBridge } from '../utils/nativeAlarmBridge';
 import {
-  Users,
+  nativeAlarmBridge,
+  RestNotificationActionPayload,
+} from '../utils/nativeAlarmBridge';
+import {
+  RestCategory,
+  normalizeDigitsToAscii,
+  computeOperationalDayKey,
+  calculateRestSessionMetrics,
+  calculateEmployeeBalance,
+  getEmployeeDetailedState,
+  classifyEmployeeCategory,
+  formatDurationArabic,
+  sanitizeAndRepairEmployees,
+} from '../utils/timeMath';
+import {
   Plus,
   Trash2,
   Edit3,
   Play,
   Pause,
-  XCircle,
   CheckCircle2,
   AlertTriangle,
-  Clock,
   Settings,
-  FileText,
   Share2,
   Download,
   Upload,
   RotateCcw,
   Volume2,
-  Sparkles,
-  UserPlus,
   BellRing,
+  Bell,
   Check,
   X,
   ChevronRight,
+  Clock,
 } from 'lucide-react';
 
 const STORAGE_KEYS = {
@@ -108,46 +116,22 @@ const DEFAULT_SETTINGS: RestSettings = {
   alarmSound: 'classic_pulse',
   alarmVolume: 0.85,
   enablePhase2Extras: true,
+  notifyOnRestEnd: true,
+  notifyOnOvertime: true,
+  overtimeAlertAfterMinutes: 5,
 };
 
-function computeOperationalDayKey(now: Date, resetHour: number, resetMinute: number): string {
-  const shifted = new Date(now);
-  const currentTotalMins = now.getHours() * 60 + now.getMinutes();
-  const resetTotalMins = resetHour * 60 + resetMinute;
-  if (currentTotalMins < resetTotalMins) {
-    shifted.setDate(shifted.getDate() - 1);
-  }
-  const y = shifted.getFullYear();
-  const m = String(shifted.getMonth() + 1).padStart(2, '0');
-  const d = String(shifted.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+const QUICK_DURATION_PRESETS = [10, 15, 20, 25, 30, 45, 60];
+
+interface EmployeeRestManagerProps {
+  onNavigateToRest?: () => void;
+  isRestTabVisible?: boolean;
 }
 
-function formatDurationArabic(totalSeconds: number, isTestMode: boolean): string {
-  if (isTestMode) {
-    const simulatedMinutes = Math.floor(totalSeconds);
-    const remainderSub = Math.round((totalSeconds - simulatedMinutes) * 60);
-    if (simulatedMinutes > 0 && remainderSub > 0) {
-      return `${simulatedMinutes} دقيقة و ${remainderSub} ثانية`;
-    }
-    if (simulatedMinutes > 0) {
-      return `${simulatedMinutes} دقيقة`;
-    }
-    return `${Math.max(1, remainderSub)} ثانية`;
-  }
-
-  const mins = Math.floor(totalSeconds / 60);
-  const secs = Math.floor(totalSeconds % 60);
-  if (mins > 0 && secs > 0) {
-    return `${mins} دقيقة و ${secs} ثانية`;
-  }
-  if (mins > 0) {
-    return `${mins} دقيقة`;
-  }
-  return `${secs} ثانية`;
-}
-
-export const EmployeeRestManager: React.FC = () => {
+export const EmployeeRestManager: React.FC<EmployeeRestManagerProps> = ({
+  onNavigateToRest,
+  isRestTabVisible = true,
+}) => {
   const [settings, setSettings] = useState<RestSettings>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
@@ -157,10 +141,19 @@ export const EmployeeRestManager: React.FC = () => {
     }
   });
 
+  // Load and sanitize employees on startup to automatically repair any corrupted or stale timers (e.g. 2364 min delay)
   const [employees, setEmployees] = useState<Employee[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
-      return saved ? JSON.parse(saved) : INITIAL_EMPLOYEES;
+      if (!saved) return INITIAL_EMPLOYEES;
+      const parsed = JSON.parse(saved);
+      const { employees: repaired } = sanitizeAndRepairEmployees(
+        parsed,
+        Date.now(),
+        DEFAULT_SETTINGS.dayResetHour,
+        DEFAULT_SETTINGS.dayResetMinute
+      );
+      return repaired.length > 0 ? repaired : INITIAL_EMPLOYEES;
     } catch {
       return INITIAL_EMPLOYEES;
     }
@@ -169,25 +162,35 @@ export const EmployeeRestManager: React.FC = () => {
   const [logs, setLogs] = useState<RestLogEntry[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.LOGS);
-      return saved ? JSON.parse(saved) : [];
+      const parsed = saved ? JSON.parse(saved) : [];
+      return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
     }
   });
 
-  // Primary View Tab: 'employees' | 'logs' | 'add_employee' | 'settings' (matching Screens 10 & 11)
+  // Primary View Tab: 'employees' | 'logs' | 'add_employee' | 'settings'
   const [subTab, setSubTab] = useState<'employees' | 'logs' | 'add_employee' | 'settings'>('employees');
+
+  // Four Main Employee Category Tabs at the top of the Employees view
+  const [activeCategoryTab, setActiveCategoryTab] = useState<RestCategory>('not_taken');
 
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
-  // Persistent Arabic Return Banner Cards (Section 5)
+  // Persistent Arabic Return Banner Cards
   const [returnBannerMessages, setReturnBannerMessages] = useState<
     { id: string; employeeName: string; lines: string[]; timestamp: string; isLate: boolean }[]
   >([]);
 
+  // Start-rest interactive prompt cards (for employees who haven't started rest yet)
+  const [startRestPrompts, setStartRestPrompts] = useState<
+    { employeeId: string; employeeName: string; allowanceMinutes: number; createdAt: string }[]
+  >([]);
+
   // Start Rest Modal State
   const [startingEmployee, setStartingEmployee] = useState<Employee | null>(null);
-  const [customMinutesInput, setCustomMinutesInput] = useState<number>(15);
+  const [customMinutesText, setCustomMinutesText] = useState<string>('15');
+  const [startModalError, setStartModalError] = useState<string | null>(null);
   const [confirmExceedModal, setConfirmExceedModal] = useState<{
     employee: Employee;
     requestedMinutes: number;
@@ -195,27 +198,90 @@ export const EmployeeRestManager: React.FC = () => {
     exceedConcurrentWarning: boolean;
   } | null>(null);
 
-  // Add / Edit / Delete Employee State (Screen 11)
+  // Add Employee State
   const [newEmpName, setNewEmpName] = useState('');
-  const [newEmpAllowance, setNewEmpAllowance] = useState(30);
+  const [newEmpAllowanceText, setNewEmpAllowanceText] = useState<string>('30');
   const [newEmpColor, setNewEmpColor] = useState('#2F80ED');
+  const [newEmpError, setNewEmpError] = useState<string | null>(null);
   const [bulkText, setBulkText] = useState('');
   const [showBulkModal, setShowBulkModal] = useState(false);
-  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
+
+  // Edit Employee / Edit Rest Duration Modal State
+  const [editingEmployeeId, setEditingEmployeeId] = useState<string | null>(null);
+  const [editEmpName, setEditEmpName] = useState<string>('');
+  const [editAllowanceText, setEditAllowanceText] = useState<string>('30');
+  const [editEmpColor, setEditEmpColor] = useState<string>('#2F80ED');
+  const [editModalError, setEditModalError] = useState<string | null>(null);
+  const [statusToast, setStatusToast] = useState<string | null>(null);
+
   const [deletingEmployee, setDeletingEmployee] = useState<Employee | null>(null);
   const [confirmNewDayModal, setConfirmNewDayModal] = useState(false);
 
-  const [shiftAlertMessage, setShiftAlertMessage] = useState<string | null>(null);
+  const [shiftAlertMessage, setShiftAlertMessage] = useState<{
+    employeeId: string;
+    employeeName: string;
+    allowanceMinutes: number;
+    text: string;
+  } | null>(null);
   const triggeredShiftAlertsRef = useRef<Set<string>>(new Set());
-  const longPressTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<any>(null);
   const [wakeLockActiveStatus, setWakeLockActiveStatus] = useState<boolean>(false);
+
+  const employeesRef = useRef<Employee[]>(employees);
+  useEffect(() => {
+    employeesRef.current = employees;
+  }, [employees]);
+
+  const settingsRef = useRef<RestSettings>(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   const currentOpDayKey = useMemo(
     () => computeOperationalDayKey(new Date(nowMs), settings.dayResetHour, settings.dayResetMinute),
     [nowMs, settings.dayResetHour, settings.dayResetMinute]
   );
   const [selectedReportDay, setSelectedReportDay] = useState<string>(currentOpDayKey);
+
+  const showNotice = useCallback((msg: string) => {
+    setStatusToast(msg);
+    setTimeout(() => setStatusToast(null), 4000);
+  }, []);
+
+  // Helper to schedule native & local notifications with current settings
+  const scheduleRestNotificationsForSession = useCallback(
+    (empId: string, empName: string, targetEndMs: number, allocatedMinutes: number) => {
+      const currSettings = settingsRef.current;
+      nativeAlarmBridge.scheduleEmployeeRestEnd(
+        empId,
+        empName,
+        targetEndMs,
+        allocatedMinutes,
+        {
+          notifyOnRestEnd: currSettings.notifyOnRestEnd ?? true,
+          notifyOnOvertime: currSettings.notifyOnOvertime ?? true,
+          overtimeAlertAfterMinutes: currSettings.overtimeAlertAfterMinutes ?? 5,
+        }
+      );
+    },
+    []
+  );
+
+  // Run a one-time mount check to repair any stale sessions relative to custom dayResetHour
+  useEffect(() => {
+    const { employees: repaired, repairedCount, repairNotes } = sanitizeAndRepairEmployees(
+      employees,
+      Date.now(),
+      settings.dayResetHour,
+      settings.dayResetMinute
+    );
+    if (repairedCount > 0) {
+      setEmployees(repaired);
+      if (repairNotes.length > 0) {
+        showNotice(repairNotes[0]);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -235,6 +301,7 @@ export const EmployeeRestManager: React.FC = () => {
     } catch {}
   }, [settings]);
 
+  // Single clean interval for live timer updates with cleanup on unmount
   useEffect(() => {
     const interval = window.setInterval(() => {
       setNowMs(Date.now());
@@ -281,6 +348,7 @@ export const EmployeeRestManager: React.FC = () => {
     };
   }, [settings.wakeLockEnabled]);
 
+  // Operational Day Rollover: reset daily counters AND close stale sessions from previous days
   useEffect(() => {
     const savedDayKey = localStorage.getItem(STORAGE_KEYS.LAST_RESET_KEY);
     if (!savedDayKey) {
@@ -289,24 +357,137 @@ export const EmployeeRestManager: React.FC = () => {
     }
     if (savedDayKey !== currentOpDayKey) {
       setEmployees((prev) =>
-        prev.map((emp) => ({
-          ...emp,
-          consumedSecondsToday: 0,
-          delaySecondsToday: 0,
-          hasStartedRestToday: emp.activeSession !== null,
-          optedOutRemainingToday: false,
-        }))
+        prev.map((emp) => {
+          let keptSession: ActiveRestSession | null = null;
+          if (emp.activeSession) {
+            const sessDayKey = computeOperationalDayKey(
+              new Date(emp.activeSession.startedAtMs),
+              settings.dayResetHour,
+              settings.dayResetMinute
+            );
+            if (sessDayKey === currentOpDayKey) {
+              keptSession = emp.activeSession;
+            } else {
+              nativeAlarmBridge.cancelEmployeeRestNotification(emp.id);
+            }
+          }
+          return {
+            ...emp,
+            consumedSecondsToday: 0,
+            delaySecondsToday: 0,
+            hasStartedRestToday: keptSession !== null,
+            optedOutRemainingToday: false,
+            activeSession: keptSession,
+          };
+        })
       );
       localStorage.setItem(STORAGE_KEYS.LAST_RESET_KEY, currentOpDayKey);
       setSelectedReportDay(currentOpDayKey);
     }
-  }, [currentOpDayKey]);
+  }, [currentOpDayKey, settings.dayResetHour, settings.dayResetMinute]);
 
+  // One-time transition check for End-of-Rest and Overtime threshold (prevents repeating notifications every second!)
+  useEffect(() => {
+    const overtimeThresholdMins = Math.max(1, settings.overtimeAlertAfterMinutes ?? 5);
+    let updatedAny = false;
+
+    const nextEmployees = employees.map((emp) => {
+      if (!emp.activeSession || emp.activeSession.isPaused) return emp;
+      const sess = emp.activeSession;
+      const metrics = calculateRestSessionMetrics({
+        startTimeMs: sess.startedAtMs,
+        allowedMinutes: sess.allocatedUnits,
+        nowMs,
+        unitMs: sess.unitMs,
+        isPaused: sess.isPaused,
+        pausedAtMs: sess.pausedAtMs,
+        totalPausedMs: sess.totalPausedMs,
+      });
+
+      if (!metrics.isValid) return emp;
+
+      // 1. Reached End of Rest for the first time
+      if (metrics.hasReachedLimit && !sess.notifiedEnd) {
+        updatedAny = true;
+        if (
+          settings.notifyOnRestEnd !== false &&
+          'Notification' in window &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            new Notification(`انتهت استراحة ${emp.name}`, {
+              body: `الموظف: ${emp.name} — انتهت المدة المحددة (${sess.allocatedUnits} د). يمكنك تسجيل العودة أو التمديد.`,
+              tag: `rest-end-${emp.id}`,
+            });
+          } catch {}
+        }
+        return {
+          ...emp,
+          activeSession: {
+            ...sess,
+            notifiedEnd: true,
+          },
+        };
+      }
+
+      // 2. Reached Overtime Threshold for the first time
+      const isOvertimeThresholdReached =
+        metrics.overtimeMinutes >= overtimeThresholdMins;
+
+      if (isOvertimeThresholdReached && !sess.notifiedOvertime) {
+        updatedAny = true;
+        if (
+          settings.notifyOnOvertime !== false &&
+          'Notification' in window &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            new Notification(`تنبيه تأخير: ${emp.name}`, {
+              body: `الموظف ${emp.name} متأخر عن استراحته بمقدار ${overtimeThresholdMins} دقيقة (المدة المخصصة: ${sess.allocatedUnits} د).`,
+              tag: `rest-overtime-${emp.id}`,
+            });
+          } catch {}
+        }
+        return {
+          ...emp,
+          activeSession: {
+            ...sess,
+            notifiedOvertime: true,
+            // Re-activate alert banner if notifyOnOvertime is enabled
+            alarmAcknowledged:
+              settings.notifyOnOvertime !== false ? false : sess.alarmAcknowledged,
+          },
+        };
+      }
+
+      return emp;
+    });
+
+    if (updatedAny) {
+      setEmployees(nextEmployees);
+    }
+  }, [
+    nowMs,
+    employees,
+    settings.notifyOnRestEnd,
+    settings.notifyOnOvertime,
+    settings.overtimeAlertAfterMinutes,
+  ]);
+
+  // Identify employees whose active rest timer has reached or exceeded the allowed duration without acknowledgement
   const unacknowledgedExpiredEmployees = useMemo(() => {
     return employees.filter((emp) => {
       if (!emp.activeSession || emp.activeSession.isPaused) return false;
-      const remainingMs = emp.activeSession.targetEndMs - nowMs;
-      return remainingMs <= 0 && !emp.activeSession.alarmAcknowledged;
+      const metrics = calculateRestSessionMetrics({
+        startTimeMs: emp.activeSession.startedAtMs,
+        allowedMinutes: emp.activeSession.allocatedUnits,
+        nowMs,
+        unitMs: emp.activeSession.unitMs,
+        isPaused: emp.activeSession.isPaused,
+        pausedAtMs: emp.activeSession.pausedAtMs,
+        totalPausedMs: emp.activeSession.totalPausedMs,
+      });
+      return metrics.isValid && metrics.hasReachedLimit && !emp.activeSession.alarmAcknowledged;
     });
   }, [employees, nowMs]);
 
@@ -326,14 +507,6 @@ export const EmployeeRestManager: React.FC = () => {
         settings.enableVibration,
         ttsPhrase
       );
-
-      if ('Notification' in window && Notification.permission === 'granted') {
-        try {
-          new Notification(`انتهت استراحة ${names}`, {
-            body: `يرجى الضغط على "تم" أو تسجيل رجوع الموظف (${names}).`,
-          });
-        } catch {}
-      }
     } else {
       soundEngine.stop();
     }
@@ -352,6 +525,7 @@ export const EmployeeRestManager: React.FC = () => {
     employees.forEach((emp) => {
       if (!emp.shiftStartTime) return;
       const [sh, sm] = emp.shiftStartTime.split(':').map(Number);
+      if (!Number.isFinite(sh) || !Number.isFinite(sm)) return;
       const preMins = emp.shiftPreAlertMinutes ?? 10;
       const shiftDate = new Date(now);
       shiftDate.setHours(sh, sm - preMins, 0, 0);
@@ -363,89 +537,142 @@ export const EmployeeRestManager: React.FC = () => {
         !triggeredShiftAlertsRef.current.has(alertKey)
       ) {
         triggeredShiftAlertsRef.current.add(alertKey);
-        setShiftAlertMessage(
-          `تنبيه مباشرة الدوام: يبدأ دوام الموظف "${emp.name}" بعد ${preMins} دقائق (الساعة ${emp.shiftStartTime})`
-        );
+        setShiftAlertMessage({
+          employeeId: emp.id,
+          employeeName: emp.name,
+          allowanceMinutes: emp.dailyAllowanceMinutes,
+          text: `تنبيه مباشرة الدوام: يبدأ دوام الموظف "${emp.name}" بعد ${preMins} دقائق (الساعة ${emp.shiftStartTime})`,
+        });
         soundEngine.playStepCompleteChime();
       }
     });
   }, [nowMs, employees, currentOpDayKey, settings.enablePhase2Extras]);
 
+  // =========================================================
+  // CENTRALIZED REST STATE & CATEGORY CLASSIFICATION
+  // =========================================================
   const getEmployeeRemainingUnits = (emp: Employee): number => {
-    const unitSec = settings.testModeMinuteAsSecond ? 1 : 60;
-    const consumedUnits = emp.consumedSecondsToday / unitSec;
-    return Math.max(0, Math.round((emp.dailyAllowanceMinutes - consumedUnits) * 10) / 10);
+    return calculateEmployeeBalance(emp).remainingMinutes;
   };
 
-  const getEmployeeStatus = (
-    emp: Employee
-  ): 'available' | 'in_rest' | 'late' | 'finished' => {
-    if (emp.activeSession) {
-      const effectiveNow = emp.activeSession.isPaused
-        ? emp.activeSession.pausedAtMs || nowMs
-        : nowMs;
-      if (effectiveNow > emp.activeSession.targetEndMs) {
-        return 'late';
-      }
-      return 'in_rest';
-    }
-    const remUnits = getEmployeeRemainingUnits(emp);
-    if (remUnits <= 0 || emp.optedOutRemainingToday) {
-      return 'finished';
-    }
-    return 'available';
-  };
+  // Single-source-of-truth partitioned view over `employees` (no duplicate employee records)
+  const categorizedEmployees = useMemo(() => {
+    const groups: Record<RestCategory, Employee[]> = {
+      not_taken: [],
+      completed: [],
+      incomplete: [],
+      exceeded: [],
+    };
+    const seenIds = new Set<string>();
+    employees.forEach((emp) => {
+      if (seenIds.has(emp.id)) return;
+      seenIds.add(emp.id);
+      const cat = classifyEmployeeCategory(emp, nowMs);
+      groups[cat].push(emp);
+    });
+    return groups;
+  }, [employees, nowMs]);
 
   const activeRestCount = useMemo(
     () => employees.filter((e) => e.activeSession !== null).length,
     [employees]
   );
 
+  // =========================================================
+  // START REST HANDLERS
+  // =========================================================
   const openStartRestModal = (emp: Employee) => {
     const rem = getEmployeeRemainingUnits(emp);
-    const defaultDuration = rem > 0 ? Math.ceil(rem) : 5;
+    const defaultDuration = rem > 0 ? Math.ceil(rem) : emp.dailyAllowanceMinutes || 15;
     setStartingEmployee(emp);
-    setCustomMinutesInput(defaultDuration);
+    setCustomMinutesText(String(defaultDuration));
+    setStartModalError(null);
   };
 
-  const executeStartRest = (emp: Employee, durationUnits: number) => {
-    const unitMs = settings.testModeMinuteAsSecond ? 1000 : 60000;
-    const startMs = Date.now();
-    const session: ActiveRestSession = {
-      startedAtMs: startMs,
-      targetEndMs: startMs + durationUnits * unitMs,
-      allocatedUnits: durationUnits,
-      unitMs,
-      isPaused: false,
-      pausedAtMs: null,
-      totalPausedMs: 0,
-      alarmAcknowledged: false,
-    };
+  const executeStartRest = useCallback(
+    (emp: Employee, durationUnits: number) => {
+      const safeDuration = Math.max(1, Math.min(240, Math.round(durationUnits)));
+      const currSettings = settingsRef.current;
+      const unitMs = currSettings.testModeMinuteAsSecond ? 1000 : 60000;
+      const startMs = Date.now();
+      const session: ActiveRestSession = {
+        startedAtMs: startMs,
+        targetEndMs: startMs + safeDuration * unitMs,
+        allocatedUnits: safeDuration,
+        unitMs,
+        isPaused: false,
+        pausedAtMs: null,
+        totalPausedMs: 0,
+        alarmAcknowledged: false,
+        notifiedEnd: false,
+        notifiedOvertime: false,
+        extendedMinutes: 0,
+      };
 
-    setEmployees((prev) =>
-      prev.map((item) =>
-        item.id === emp.id
-          ? {
-              ...item,
-              hasStartedRestToday: true,
-              optedOutRemainingToday: false,
-              activeSession: session,
-            }
-          : item
-      )
+      setEmployees((prev) =>
+        prev.map((item) =>
+          item.id === emp.id
+            ? {
+                ...item,
+                hasStartedRestToday: true,
+                optedOutRemainingToday: false,
+                activeSession: session,
+              }
+            : item
+        )
+      );
+      setStartingEmployee(null);
+      setConfirmExceedModal(null);
+      setStartRestPrompts((prev) => prev.filter((p) => p.employeeId !== emp.id));
+
+      // Automatically switch to 'incomplete' tab so the user sees the running timer immediately
+      setActiveCategoryTab('incomplete');
+
+      scheduleRestNotificationsForSession(
+        emp.id,
+        emp.name,
+        session.targetEndMs,
+        safeDuration
+      );
+
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+    },
+    [scheduleRestNotificationsForSession]
+  );
+
+  const handleSendStartRestNotification = async (emp: Employee) => {
+    const rem = getEmployeeRemainingUnits(emp);
+    const duration = rem > 0 ? Math.ceil(rem) : emp.dailyAllowanceMinutes || 30;
+    await nativeAlarmBridge.sendStartRestPromptNotification(emp.id, emp.name, duration);
+
+    setStartRestPrompts((prev) => {
+      const filtered = prev.filter((p) => p.employeeId !== emp.id);
+      return [
+        {
+          employeeId: emp.id,
+          employeeName: emp.name,
+          allowanceMinutes: duration,
+          createdAt: new Date().toLocaleTimeString('ar-SA', {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+        },
+        ...filtered,
+      ];
+    });
+    showNotice(
+      `تم إرسال إشعار تفاعلي لبدء استراحة الموظف "${emp.name}" (${duration} دقيقة) مع زر "بدء الاستراحة".`
     );
-    setStartingEmployee(null);
-    setConfirmExceedModal(null);
-
-    nativeAlarmBridge.scheduleEmployeeRestEnd(emp.id, emp.name, session.targetEndMs);
-
-    if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => {});
-    }
   };
 
   const requestStartRest = (emp: Employee, requestedUnits: number) => {
-    if (requestedUnits <= 0) return;
+    if (!Number.isFinite(requestedUnits) || requestedUnits < 1 || requestedUnits > 240) {
+      setStartModalError('يرجى إدخال مدة صحيحة بين 1 و 240 دقيقة.');
+      return;
+    }
+    setStartModalError(null);
     const remUnits = getEmployeeRemainingUnits(emp);
     const exceedsAllowance = requestedUnits > remUnits;
     const exceedsConcurrent =
@@ -466,6 +693,123 @@ export const EmployeeRestManager: React.FC = () => {
     executeStartRest(emp, requestedUnits);
   };
 
+  const handleStartWithCustomInput = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!startingEmployee) return;
+    const clean = normalizeDigitsToAscii(customMinutesText);
+    const parsed = parseInt(clean, 10);
+    if (!clean || isNaN(parsed) || parsed < 1 || parsed > 240) {
+      setStartModalError('يرجى كتابة رقم صحيح للمدة بين 1 و 240 دقيقة.');
+      return;
+    }
+    requestStartRest(startingEmployee, parsed);
+  };
+
+  // =========================================================
+  // EDIT EMPLOYEE & REST DURATION HANDLERS
+  // =========================================================
+  const openEditEmployeeModal = (emp: Employee) => {
+    setEditingEmployeeId(emp.id);
+    setEditEmpName(emp.name);
+    setEditAllowanceText(String(emp.dailyAllowanceMinutes));
+    setEditEmpColor(emp.avatarColor || '#2F80ED');
+    setEditModalError(null);
+  };
+
+  const editingEmployeeObj = useMemo(
+    () => employees.find((e) => e.id === editingEmployeeId) || null,
+    [employees, editingEmployeeId]
+  );
+
+  const handleResetSingleEmployeeToday = (empId: string) => {
+    nativeAlarmBridge.cancelEmployeeRestNotification(empId);
+    setEmployees((prev) =>
+      prev.map((item) =>
+        item.id === empId
+          ? {
+              ...item,
+              consumedSecondsToday: 0,
+              delaySecondsToday: 0,
+              hasStartedRestToday: false,
+              optedOutRemainingToday: false,
+              activeSession: null,
+            }
+          : item
+      )
+    );
+    setEditingEmployeeId(null);
+    setActiveCategoryTab('not_taken');
+    showNotice('تم تصفير سجل ومؤقت الموظف لهذا اليوم وإعادته لقسم «لم يأخذوا استراحتهم».');
+  };
+
+  const handleSaveEditedEmployee = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingEmployeeId) return;
+
+    const trimmedName = editEmpName.trim();
+    if (!trimmedName) {
+      setEditModalError('يرجى إدخال اسم الموظف.');
+      return;
+    }
+
+    const cleanDigits = normalizeDigitsToAscii(editAllowanceText);
+    const parsedMinutes = parseInt(cleanDigits, 10);
+
+    if (!cleanDigits || isNaN(parsedMinutes) || parsedMinutes < 1 || parsedMinutes > 240) {
+      setEditModalError('يرجى إدخال مدة استراحة صحيحة بين 1 و 240 دقيقة.');
+      return;
+    }
+
+    setEmployees((prev) =>
+      prev.map((item) => {
+        if (item.id !== editingEmployeeId) return item;
+
+        let updatedSession = item.activeSession;
+        if (item.activeSession) {
+          const sess = item.activeSession;
+          const newTargetEndMs =
+            sess.startedAtMs + sess.totalPausedMs + parsedMinutes * sess.unitMs;
+          const isFuture = newTargetEndMs > Date.now();
+          updatedSession = {
+            ...sess,
+            allocatedUnits: parsedMinutes,
+            targetEndMs: newTargetEndMs,
+            alarmAcknowledged: isFuture ? false : sess.alarmAcknowledged,
+            notifiedEnd: isFuture ? false : sess.notifiedEnd,
+            notifiedOvertime: isFuture ? false : sess.notifiedOvertime,
+          };
+          if (!sess.isPaused) {
+            if (isFuture) {
+              scheduleRestNotificationsForSession(
+                item.id,
+                trimmedName,
+                newTargetEndMs,
+                parsedMinutes
+              );
+            } else {
+              nativeAlarmBridge.cancelEmployeeRestNotification(item.id);
+            }
+          }
+        }
+
+        return {
+          ...item,
+          name: trimmedName,
+          dailyAllowanceMinutes: parsedMinutes,
+          avatarColor: editEmpColor,
+          activeSession: updatedSession,
+        };
+      })
+    );
+
+    setEditingEmployeeId(null);
+    setEditModalError(null);
+    showNotice(`تم حفظ مدة الاستراحة لـ "${trimmedName}" (${parsedMinutes} دقيقة) بنجاح.`);
+  };
+
+  // =========================================================
+  // ACTIVE TIMER CONTROLS & NOTIFICATION ACTION EXECUTORS
+  // =========================================================
   const handleTogglePause = (empId: string) => {
     const currentNow = Date.now();
     setEmployees((prev) =>
@@ -483,16 +827,26 @@ export const EmployeeRestManager: React.FC = () => {
             },
           };
         } else {
-          const pausedDelta = sess.pausedAtMs ? currentNow - sess.pausedAtMs : 0;
-          const newTargetEndMs = sess.targetEndMs + pausedDelta;
-          nativeAlarmBridge.scheduleEmployeeRestEnd(emp.id, emp.name, newTargetEndMs);
+          const pausedDelta =
+            sess.pausedAtMs && currentNow > sess.pausedAtMs
+              ? currentNow - sess.pausedAtMs
+              : 0;
+          const newTotalPausedMs = sess.totalPausedMs + pausedDelta;
+          const newTargetEndMs =
+            sess.startedAtMs + newTotalPausedMs + sess.allocatedUnits * sess.unitMs;
+          scheduleRestNotificationsForSession(
+            emp.id,
+            emp.name,
+            newTargetEndMs,
+            sess.allocatedUnits
+          );
           return {
             ...emp,
             activeSession: {
               ...sess,
               isPaused: false,
               pausedAtMs: null,
-              totalPausedMs: sess.totalPausedMs + pausedDelta,
+              totalPausedMs: newTotalPausedMs,
               targetEndMs: newTargetEndMs,
             },
           };
@@ -501,28 +855,61 @@ export const EmployeeRestManager: React.FC = () => {
     );
   };
 
-  const handleAddFiveMinutes = (empId: string) => {
-    setEmployees((prev) =>
-      prev.map((emp) => {
-        if (emp.id !== empId || !emp.activeSession) return emp;
-        const sess = emp.activeSession;
-        const addMs = 5 * sess.unitMs;
-        const newTargetEndMs = sess.targetEndMs + addMs;
-        if (!sess.isPaused) {
-          nativeAlarmBridge.scheduleEmployeeRestEnd(emp.id, emp.name, newTargetEndMs);
-        }
-        return {
-          ...emp,
-          activeSession: {
-            ...sess,
-            allocatedUnits: sess.allocatedUnits + 5,
-            targetEndMs: newTargetEndMs,
-            alarmAcknowledged: false,
-          },
-        };
-      })
-    );
-  };
+  const handleExtendRestMinutes = useCallback(
+    (empId: string, extraMinutes = 5) => {
+      const safeExtra = Math.max(1, Math.min(120, Math.round(extraMinutes)));
+      let targetEmpName = '';
+      let newTotalAllocated = 0;
+
+      setEmployees((prev) =>
+        prev.map((emp) => {
+          if (emp.id !== empId || !emp.activeSession) return emp;
+          targetEmpName = emp.name;
+          const sess = emp.activeSession;
+          const now = Date.now();
+          // Ensure extending from an already-expired session gives a future end time
+          const currentElapsedUnits = Math.floor(
+            Math.max(0, now - sess.startedAtMs - sess.totalPausedMs) / sess.unitMs
+          );
+          const baseUnits = Math.max(sess.allocatedUnits, currentElapsedUnits);
+          const newAllocated = Math.min(240, baseUnits + safeExtra);
+          newTotalAllocated = newAllocated;
+          const newTargetEndMs =
+            sess.startedAtMs + sess.totalPausedMs + newAllocated * sess.unitMs;
+
+          if (!sess.isPaused) {
+            scheduleRestNotificationsForSession(
+              emp.id,
+              emp.name,
+              newTargetEndMs,
+              newAllocated
+            );
+          }
+
+          return {
+            ...emp,
+            activeSession: {
+              ...sess,
+              allocatedUnits: newAllocated,
+              targetEndMs: newTargetEndMs,
+              alarmAcknowledged: false,
+              notifiedEnd: false,
+              notifiedOvertime: false,
+              extendedMinutes: (sess.extendedMinutes || 0) + safeExtra,
+            },
+          };
+        })
+      );
+
+      if (targetEmpName) {
+        setActiveCategoryTab('incomplete');
+        showNotice(
+          `تم تمديد استراحة الموظف "${targetEmpName}" بمقدار +${safeExtra} دقائق (الإجمالي: ${newTotalAllocated} د).`
+        );
+      }
+    },
+    [scheduleRestNotificationsForSession, showNotice]
+  );
 
   const handleCancelRest = (empId: string) => {
     nativeAlarmBridge.cancelEmployeeRestNotification(empId);
@@ -554,133 +941,285 @@ export const EmployeeRestManager: React.FC = () => {
     );
   };
 
-  const handleEmployeeReturned = (emp: Employee) => {
-    if (!emp.activeSession) return;
-    nativeAlarmBridge.cancelEmployeeRestNotification(emp.id);
-    const sess = emp.activeSession;
-    const endMs = sess.isPaused && sess.pausedAtMs ? sess.pausedAtMs : Date.now();
-    const totalActiveMs = Math.max(1000, endMs - sess.startedAtMs - sess.totalPausedMs);
+  const handleEmployeeReturned = useCallback(
+    (emp: Employee, markSatisfiedEarly = false, customEndTimestampMs?: number) => {
+      if (!emp.activeSession) return;
+      nativeAlarmBridge.cancelEmployeeRestNotification(emp.id);
+      const sess = emp.activeSession;
+      const rawEndMs =
+        customEndTimestampMs && customEndTimestampMs >= sess.startedAtMs
+          ? customEndTimestampMs
+          : Date.now();
+      const endMs = sess.isPaused && sess.pausedAtMs ? sess.pausedAtMs : rawEndMs;
 
-    const isTestOption = sess.unitMs === 1000;
-    const unitSec = isTestOption ? 1 : 60;
+      const metrics = calculateRestSessionMetrics({
+        startTimeMs: sess.startedAtMs,
+        allowedMinutes: sess.allocatedUnits,
+        nowMs: endMs,
+        unitMs: sess.unitMs,
+        isPaused: sess.isPaused,
+        pausedAtMs: sess.pausedAtMs,
+        totalPausedMs: sess.totalPausedMs,
+      });
 
-    const actualElapsedSeconds = Math.round(totalActiveMs / 1000);
-    const allocatedSeconds = Math.round(sess.allocatedUnits * unitSec);
-    const sessionDelaySeconds = Math.max(0, actualElapsedSeconds - allocatedSeconds);
+      const isTestOption = sess.unitMs === 1000;
 
-    const newTotalConsumedSeconds = emp.consumedSecondsToday + actualElapsedSeconds;
-    const newTotalDelaySeconds = emp.delaySecondsToday + sessionDelaySeconds;
+      // Normalize elapsed & overtime to STANDARD seconds (60 standard seconds = 1 minute of rest)
+      const actualStandardSeconds = isTestOption
+        ? Math.max(60, Math.round((metrics.elapsedMs / 1000) * 60))
+        : Math.max(1, Math.round(metrics.elapsedMs / 1000));
 
-    const allowanceTotalSeconds = emp.dailyAllowanceMinutes * unitSec;
-    const remainingAfterSeconds = allowanceTotalSeconds - newTotalConsumedSeconds;
+      const sessionDelayStandardSeconds = isTestOption
+        ? Math.max(0, Math.round((metrics.overtimeMs / 1000) * 60))
+        : Math.max(0, Math.round(metrics.overtimeMs / 1000));
 
-    const takenUnitsRounded = Math.max(1, Math.round(actualElapsedSeconds / unitSec));
-    const remainingUnitsRounded = Math.round(remainingAfterSeconds / unitSec);
-    const delayUnitsRounded = Math.round(sessionDelaySeconds / unitSec);
-    const exceededTotalUnitsRounded = Math.round(
-      Math.max(0, newTotalConsumedSeconds - allowanceTotalSeconds) / unitSec
-    );
+      const newTotalConsumedSeconds = emp.consumedSecondsToday + actualStandardSeconds;
+      const newTotalDelaySeconds = emp.delaySecondsToday + sessionDelayStandardSeconds;
 
-    const messageLines: string[] = [];
-    let isLateOrExceeded = false;
+      const allowanceTotalSeconds = emp.dailyAllowanceMinutes * 60;
+      const remainingAfterSeconds = allowanceTotalSeconds - newTotalConsumedSeconds;
 
-    if (sessionDelaySeconds > 0 || remainingAfterSeconds < 0) {
-      isLateOrExceeded = true;
-      if (sessionDelaySeconds > 0) {
-        const delayFormatted =
-          delayUnitsRounded > 0
-            ? `${delayUnitsRounded} دقائق`
-            : formatDurationArabic(sessionDelaySeconds, isTestOption);
+      const takenMinutesRounded = Math.max(1, Math.round(actualStandardSeconds / 60));
+      const remainingMinutesRounded =
+        Math.max(0, Math.round((remainingAfterSeconds / 60) * 10) / 10);
+      const delayMinutesRounded = Math.floor(sessionDelayStandardSeconds / 60);
+      const exceededTotalMinutesRounded = Math.round(
+        Math.max(0, newTotalConsumedSeconds - allowanceTotalSeconds) / 60
+      );
+
+      const messageLines: string[] = [];
+      let isLateOrExceeded = false;
+
+      const isCompletedNow = remainingMinutesRounded <= 0 || markSatisfiedEarly;
+
+      if (sessionDelayStandardSeconds > 0 || remainingAfterSeconds < 0) {
+        isLateOrExceeded = true;
+        if (sessionDelayStandardSeconds > 0) {
+          const delayFormatted =
+            delayMinutesRounded > 0
+              ? `${delayMinutesRounded} دقيقة`
+              : formatDurationArabic(sessionDelayStandardSeconds);
+          messageLines.push(
+            `${emp.name} تأخر ${delayFormatted} بعد انتهاء مدة استراحته (${sess.allocatedUnits} د)`
+          );
+        }
+        if (remainingAfterSeconds < 0) {
+          const exceedFormatted =
+            exceededTotalMinutesRounded > 0
+              ? `${exceededTotalMinutesRounded} دقيقة`
+              : formatDurationArabic(Math.abs(remainingAfterSeconds));
+          messageLines.push(`تجاوز رصيده اليومي بمقدار ${exceedFormatted}`);
+        } else if (remainingMinutesRounded > 0 && !markSatisfiedEarly) {
+          messageLines.push(`بقي له ${remainingMinutesRounded} دقيقة من رصيده اليومي`);
+        } else {
+          messageLines.push(`${emp.name} أنهى رصيد استراحته اليومي`);
+        }
+      } else if (isCompletedNow) {
         messageLines.push(
-          `${emp.name} تأخر ${delayFormatted} زيادة على ريسته (${formatDurationArabic(
-            sessionDelaySeconds,
-            isTestOption
-          )})`
+          `${emp.name} أنهى استراحته في الوقت المحدد (${takenMinutesRounded} دقيقة)`
+        );
+      } else {
+        messageLines.push(
+          `${emp.name} أخذ ${takenMinutesRounded} دقيقة (أنهى مبكراً)، وبقي له ${remainingMinutesRounded} دقيقة`
         );
       }
-      if (remainingAfterSeconds < 0) {
-        const exceedFormatted =
-          exceededTotalUnitsRounded > 0
-            ? `${exceededTotalUnitsRounded} دقائق`
-            : formatDurationArabic(Math.abs(remainingAfterSeconds), isTestOption);
-        messageLines.push(`تجاوز رصيده بـ ${exceedFormatted}`);
-      } else if (remainingAfterSeconds > 0) {
-        messageLines.push(`بقي له ${Math.max(1, remainingUnitsRounded)} دقائق من رصيده اليومي`);
-      } else {
-        messageLines.push(`${emp.name} أنهى رصيد استراحته`);
-      }
-    } else if (remainingUnitsRounded <= 0) {
-      messageLines.push(`${emp.name} أنهى رصيد استراحته`);
-    } else {
-      messageLines.push(
-        `${emp.name} أخذ ${takenUnitsRounded} دقيقة، بقي له ${remainingUnitsRounded} دقائق`
+
+      const summaryText = messageLines.join(' — ');
+      const opDayKey = computeOperationalDayKey(
+        new Date(endMs),
+        settingsRef.current.dayResetHour,
+        settingsRef.current.dayResetMinute
       );
-    }
 
-    const summaryText = messageLines.join(' — ');
+      const newLog: RestLogEntry = {
+        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        dayKey: opDayKey,
+        employeeId: emp.id,
+        employeeName: emp.name,
+        startedAtIso: new Date(metrics.startTimeMs || endMs).toISOString(),
+        endedAtIso: new Date(endMs).toISOString(),
+        allocatedMinutes: sess.allocatedUnits,
+        actualSeconds: actualStandardSeconds,
+        delaySeconds: sessionDelayStandardSeconds,
+        remainingAfterSeconds: Math.max(0, remainingAfterSeconds),
+        summaryMessage: summaryText,
+        wasTestMode: false,
+      };
 
-    const newLog: RestLogEntry = {
-      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      dayKey: currentOpDayKey,
-      employeeId: emp.id,
-      employeeName: emp.name,
-      startedAtIso: new Date(sess.startedAtMs).toISOString(),
-      endedAtIso: new Date(endMs).toISOString(),
-      allocatedMinutes: sess.allocatedUnits,
-      actualSeconds: actualElapsedSeconds,
-      delaySeconds: sessionDelaySeconds,
-      remainingAfterSeconds: Math.max(0, remainingAfterSeconds),
-      summaryMessage: summaryText,
-      wasTestMode: isTestOption,
+      setLogs((prev) => [newLog, ...prev]);
+
+      setEmployees((prev) =>
+        prev.map((item) =>
+          item.id === emp.id
+            ? {
+                ...item,
+                consumedSecondsToday: newTotalConsumedSeconds,
+                delaySecondsToday: newTotalDelaySeconds,
+                hasStartedRestToday: true,
+                optedOutRemainingToday: markSatisfiedEarly
+                  ? true
+                  : item.optedOutRemainingToday,
+                activeSession: null,
+              }
+            : item
+        )
+      );
+
+      // Move active tab to the employee's resulting category
+      if (isCompletedNow) {
+        setActiveCategoryTab('completed');
+      } else {
+        setActiveCategoryTab('incomplete');
+      }
+
+      setReturnBannerMessages((prev) => [
+        {
+          id: newLog.id,
+          employeeName: emp.name,
+          lines: messageLines,
+          timestamp: new Date(endMs).toLocaleTimeString('ar-SA', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          }),
+          isLate: isLateOrExceeded,
+        },
+        ...prev,
+      ]);
+    },
+    []
+  );
+
+  // Process interactive notification actions from Android Status Bar / BroadcastReceiver / LocalNotifications
+  const processNotificationAction = useCallback(
+    (payload: RestNotificationActionPayload) => {
+      if (!payload || !payload.action) return;
+
+      if (payload.action === 'OPEN_REST_PAGE') {
+        onNavigateToRest?.();
+        setSubTab('employees');
+        if (payload.employeeId) {
+          const target = employeesRef.current.find((e) => e.id === payload.employeeId);
+          if (target) {
+            const cat = classifyEmployeeCategory(target, Date.now());
+            setActiveCategoryTab(cat);
+          }
+        }
+        return;
+      }
+
+      const targetEmp = employeesRef.current.find((e) => e.id === payload.employeeId);
+      if (!targetEmp) return;
+
+      if (payload.action === 'MARK_RETURNED' || payload.action === 'END_REST') {
+        onNavigateToRest?.();
+        setSubTab('employees');
+        if (targetEmp.activeSession) {
+          handleEmployeeReturned(targetEmp, false, payload.timestampMs);
+          showNotice(
+            `تم تسجيل عودة الموظف "${targetEmp.name}" من خلال زر الإشعار وإيقاف المؤقت.`
+          );
+        }
+      } else if (payload.action === 'EXTEND_REST') {
+        onNavigateToRest?.();
+        setSubTab('employees');
+        const extraMins = payload.extraMinutes && payload.extraMinutes > 0 ? payload.extraMinutes : 5;
+        if (targetEmp.activeSession) {
+          handleExtendRestMinutes(targetEmp.id, extraMins);
+        } else {
+          executeStartRest(targetEmp, extraMins);
+        }
+      } else if (payload.action === 'START_REST') {
+        onNavigateToRest?.();
+        setSubTab('employees');
+        if (!targetEmp.activeSession) {
+          const rem = calculateEmployeeBalance(targetEmp).remainingMinutes;
+          const dur =
+            payload.extraMinutes && payload.extraMinutes > 0
+              ? payload.extraMinutes
+              : rem > 0
+              ? Math.ceil(rem)
+              : targetEmp.dailyAllowanceMinutes || 30;
+          executeStartRest(targetEmp, dur);
+          showNotice(`تم بدء استراحة الموظف "${targetEmp.name}" (${dur} د) من خلال زر الإشعار.`);
+        }
+      }
+    },
+    [executeStartRest, handleEmployeeReturned, handleExtendRestMinutes, onNavigateToRest, showNotice]
+  );
+
+  // Subscribe to real-time notification actions AND consume any queued background actions on mount/resume
+  useEffect(() => {
+    let isMounted = true;
+
+    const drainPendingActions = async () => {
+      const pending = await nativeAlarmBridge.consumePendingRestActions();
+      if (!isMounted || pending.length === 0) return;
+      pending.forEach((act) => {
+        processNotificationAction(act);
+      });
     };
 
-    setLogs((prev) => [newLog, ...prev]);
+    drainPendingActions();
 
-    setEmployees((prev) =>
-      prev.map((item) =>
-        item.id === emp.id
-          ? {
-              ...item,
-              consumedSecondsToday: newTotalConsumedSeconds,
-              delaySecondsToday: newTotalDelaySeconds,
-              hasStartedRestToday: true,
-              activeSession: null,
-            }
-          : item
-      )
-    );
+    const unsubscribe = nativeAlarmBridge.onRestNotificationAction((payload) => {
+      if (!isMounted) return;
+      processNotificationAction(payload);
+    });
 
-    setReturnBannerMessages((prev) => [
-      {
-        id: newLog.id,
-        employeeName: emp.name,
-        lines: messageLines,
-        timestamp: new Date(endMs).toLocaleTimeString('ar-SA', {
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-        }),
-        isLate: isLateOrExceeded,
-      },
-      ...prev,
-    ]);
-  };
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        drainPendingActions();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', handleVisibilityOrFocus);
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+    };
+  }, [processNotificationAction]);
 
   const handleMarkSatisfied = (empId: string) => {
     setEmployees((prev) =>
       prev.map((emp) =>
-        emp.id === empId ? { ...emp, optedOutRemainingToday: true } : emp
+        emp.id === empId
+          ? { ...emp, hasStartedRestToday: true, optedOutRemainingToday: true }
+          : emp
+      )
+    );
+    showNotice('تم اعتماد إنهاء الاستراحة ونقل الموظف إلى قسم «أنهوا استراحتهم».');
+  };
+
+  const handleReopenIncomplete = (empId: string) => {
+    setEmployees((prev) =>
+      prev.map((emp) =>
+        emp.id === empId ? { ...emp, optedOutRemainingToday: false } : emp
       )
     );
   };
 
   const handleAddSingleEmployee = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newEmpName.trim()) return;
+    if (!newEmpName.trim()) {
+      setNewEmpError('يرجى إدخال اسم الموظف.');
+      return;
+    }
+    const cleanDigits = normalizeDigitsToAscii(newEmpAllowanceText);
+    const parsedAllowance = parseInt(cleanDigits, 10);
+    if (!cleanDigits || isNaN(parsedAllowance) || parsedAllowance < 1 || parsedAllowance > 240) {
+      setNewEmpError('يرجى إدخال مدة استراحة صحيحة بين 1 و 240 دقيقة.');
+      return;
+    }
+
     const created: Employee = {
       id: `emp-${Date.now()}`,
       name: newEmpName.trim(),
-      dailyAllowanceMinutes: Math.max(1, Number(newEmpAllowance) || 30),
+      dailyAllowanceMinutes: parsedAllowance,
       consumedSecondsToday: 0,
       delaySecondsToday: 0,
       hasStartedRestToday: false,
@@ -690,8 +1229,11 @@ export const EmployeeRestManager: React.FC = () => {
     };
     setEmployees((prev) => [...prev, created]);
     setNewEmpName('');
-    setNewEmpAllowance(30);
+    setNewEmpAllowanceText('30');
+    setNewEmpError(null);
     setSubTab('employees');
+    setActiveCategoryTab('not_taken');
+    showNotice(`تمت إضافة الموظف "${created.name}" بمدة استراحة ${parsedAllowance} دقيقة.`);
   };
 
   const handleBulkAddEmployees = (e: React.FormEvent) => {
@@ -720,26 +1262,24 @@ export const EmployeeRestManager: React.FC = () => {
     setBulkText('');
     setShowBulkModal(false);
     setSubTab('employees');
-  };
-
-  const handleSaveEditedEmployee = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingEmployee || !editingEmployee.name.trim()) return;
-    setEmployees((prev) =>
-      prev.map((item) =>
-        item.id === editingEmployee.id ? editingEmployee : item
-      )
-    );
-    setEditingEmployee(null);
+    setActiveCategoryTab('not_taken');
   };
 
   const handleConfirmDeleteEmployee = () => {
     if (!deletingEmployee) return;
+    if (deletingEmployee.activeSession) {
+      nativeAlarmBridge.cancelEmployeeRestNotification(deletingEmployee.id);
+    }
     setEmployees((prev) => prev.filter((item) => item.id !== deletingEmployee.id));
     setDeletingEmployee(null);
   };
 
   const handleStartNewDayNow = () => {
+    employees.forEach((emp) => {
+      if (emp.activeSession) {
+        nativeAlarmBridge.cancelEmployeeRestNotification(emp.id);
+      }
+    });
     setEmployees((prev) =>
       prev.map((emp) => ({
         ...emp,
@@ -753,6 +1293,9 @@ export const EmployeeRestManager: React.FC = () => {
     localStorage.setItem(STORAGE_KEYS.LAST_RESET_KEY, currentOpDayKey);
     setConfirmNewDayModal(false);
     setReturnBannerMessages([]);
+    setStartRestPrompts([]);
+    setActiveCategoryTab('not_taken');
+    showNotice('تم بدء يوم عمل جديد وإعادة ضبط أرصدة الاستراحات لجميع الموظفين.');
   };
 
   const handleExportBackup = () => {
@@ -781,7 +1324,15 @@ export const EmployeeRestManager: React.FC = () => {
     reader.onload = (event) => {
       try {
         const parsed = JSON.parse(String(event.target?.result || '{}'));
-        if (Array.isArray(parsed.employees)) setEmployees(parsed.employees);
+        if (Array.isArray(parsed.employees)) {
+          const { employees: repaired } = sanitizeAndRepairEmployees(
+            parsed.employees,
+            Date.now(),
+            settings.dayResetHour,
+            settings.dayResetMinute
+          );
+          setEmployees(repaired);
+        }
         if (Array.isArray(parsed.logs)) setLogs(parsed.logs);
         if (parsed.settings) setSettings({ ...DEFAULT_SETTINGS, ...parsed.settings });
       } catch {}
@@ -799,13 +1350,11 @@ export const EmployeeRestManager: React.FC = () => {
 
     employees.forEach((emp) => {
       const empLogs = dayLogs.filter((l) => l.employeeId === emp.id);
-      const remUnits = getEmployeeRemainingUnits(emp);
-      const unitSec = settings.testModeMinuteAsSecond ? 1 : 60;
-      const delayMins = Math.round((emp.delaySecondsToday / unitSec) * 10) / 10;
+      const { allowanceMinutes, remainingMinutes, delayMinutes } = calculateEmployeeBalance(emp);
 
       lines.push(
-        `👤 *${emp.name}* (الرصيد: ${emp.dailyAllowanceMinutes} د | المتبقي: ${remUnits} د${
-          delayMins > 0 ? ` | التأخير: ${delayMins} د` : ''
+        `👤 *${emp.name}* (الرصيد: ${allowanceMinutes} د | المتبقي: ${remainingMinutes} د${
+          delayMinutes > 0 ? ` | التأخير: ${delayMinutes} د` : ''
         })`
       );
 
@@ -850,54 +1399,160 @@ export const EmployeeRestManager: React.FC = () => {
     } catch {}
   };
 
-  const notStartedEmployees = useMemo(() => {
-    return employees.filter((emp) => {
-      const rem = getEmployeeRemainingUnits(emp);
-      if (rem <= 0 || emp.optedOutRemainingToday) return false;
-      return emp.consumedSecondsToday === 0;
-    });
-  }, [employees, settings.testModeMinuteAsSecond]);
-
-  const partialRemainingEmployees = useMemo(() => {
-    return employees.filter((emp) => {
-      const rem = getEmployeeRemainingUnits(emp);
-      if (rem <= 0 || emp.optedOutRemainingToday) return false;
-      return emp.consumedSecondsToday > 0;
-    });
-  }, [employees, settings.testModeMinuteAsSecond]);
-
-  const statusCounts = useMemo(() => {
-    let greenFinished = 0;
-    let orangePartial = 0;
-    let grayNotTaken = 0;
-    let redLate = 0;
-
-    employees.forEach((emp) => {
-      const st = getEmployeeStatus(emp);
-      if (st === 'late' || emp.delaySecondsToday > 0) {
-        redLate++;
-      }
-      if (st === 'finished') {
-        greenFinished++;
-      } else if (emp.consumedSecondsToday > 0) {
-        orangePartial++;
-      } else {
-        grayNotTaken++;
-      }
-    });
-
-    return { greenFinished, orangePartial, grayNotTaken, redLate };
-  }, [employees, nowMs, settings.testModeMinuteAsSecond]);
-
   const availableLogDays = useMemo(() => {
     const set = new Set<string>([currentOpDayKey]);
     logs.forEach((l) => set.add(l.dayKey));
     return Array.from(set).sort().reverse();
   }, [logs, currentOpDayKey]);
 
+  const categoryTabsMeta: {
+    id: RestCategory;
+    label: string;
+    count: number;
+    badgeBg: string;
+    badgeText: string;
+    emptyMessage: string;
+  }[] = [
+    {
+      id: 'not_taken',
+      label: 'لم يأخذوا استراحتهم',
+      count: categorizedEmployees.not_taken.length,
+      badgeBg: 'bg-[#EBF3FE]',
+      badgeText: 'text-[#2F80ED]',
+      emptyMessage: 'جميع الموظفين بدأوا أو أنهوا استراحاتهم اليوم.',
+    },
+    {
+      id: 'completed',
+      label: 'أنهوا استراحتهم',
+      count: categorizedEmployees.completed.length,
+      badgeBg: 'bg-[#E6F8EF]',
+      badgeText: 'text-[#10B981]',
+      emptyMessage: 'لا يوجد موظفون أنهوا مدة استراحتهم بالكامل حتى الآن.',
+    },
+    {
+      id: 'incomplete',
+      label: 'لم يكملوا استراحتهم',
+      count: categorizedEmployees.incomplete.length,
+      badgeBg: 'bg-[#FFF4E5]',
+      badgeText: 'text-[#F59E0B]',
+      emptyMessage: 'لا توجد استراحات جارية أو متوقفة مبكراً في الوقت الحالي.',
+    },
+    {
+      id: 'exceeded',
+      label: 'تجاوزوا مدة الاستراحة',
+      count: categorizedEmployees.exceeded.length,
+      badgeBg: 'bg-rose-100',
+      badgeText: 'text-rose-600',
+      emptyMessage: 'ممتاز! لا يوجد أي موظف متجاوز لمدة الاستراحة حالياً.',
+    },
+  ];
+
+  const activeCategoryEmployees = categorizedEmployees[activeCategoryTab];
+  const activeCategoryMeta =
+    categoryTabsMeta.find((c) => c.id === activeCategoryTab) || categoryTabsMeta[0];
+
+  // If the user is on another tab (e.g. Home / Alarms), render any active interactive Rest Notification Banner globally at the top
+  if (!isRestTabVisible) {
+    if (unacknowledgedExpiredEmployees.length === 0) return null;
+    return (
+      <div className="mb-4 space-y-3">
+        {unacknowledgedExpiredEmployees.map((emp) => {
+          const sess = emp.activeSession!;
+          const metrics = calculateRestSessionMetrics({
+            startTimeMs: sess.startedAtMs,
+            allowedMinutes: sess.allocatedUnits,
+            nowMs,
+            unitMs: sess.unitMs,
+            isPaused: sess.isPaused,
+            pausedAtMs: sess.pausedAtMs,
+            totalPausedMs: sess.totalPausedMs,
+          });
+          const overtimeThreshold = settings.overtimeAlertAfterMinutes ?? 5;
+          const isOvertimeAlert = metrics.overtimeMinutes >= overtimeThreshold;
+          const delayLabel =
+            metrics.overtimeMinutes > 0
+              ? `${metrics.overtimeMinutes} دقيقة`
+              : `${Math.max(1, Math.ceil(metrics.overtimeMs / 1000))} ثانية`;
+
+          return (
+            <div
+              key={emp.id}
+              className="rounded-3xl border-2 border-rose-500 bg-rose-600 text-white p-5 shadow-xl space-y-3"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-3">
+                  <Volume2 className="w-7 h-7 text-white shrink-0 animate-bounce" />
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-lg bg-white/20 text-[11px] font-extrabold">
+                        {isOvertimeAlert
+                          ? 'إشعار تأخير موظف'
+                          : 'إشعار انتهاء مدة الاستراحة'}
+                      </span>
+                      <span className="font-mono text-xs text-rose-100">
+                        المدة المخصصة: {sess.allocatedUnits} د
+                      </span>
+                    </div>
+                    <h4 className="text-lg font-extrabold mt-0.5">
+                      الموظف: {emp.name} — التأخير الحالي: +{delayLabel}
+                    </h4>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => onNavigateToRest?.()}
+                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-bold cursor-pointer"
+                >
+                  فتح إدارة الاستراحات
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleEmployeeReturned(emp, false)}
+                  className="min-h-[44px] px-4 py-2 rounded-xl bg-white text-emerald-800 hover:bg-emerald-50 font-extrabold text-xs flex items-center gap-1.5 shadow-sm cursor-pointer"
+                >
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>تمت العودة (إنهاء الاستراحة)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleExtendRestMinutes(emp.id, 5)}
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl bg-amber-400 text-slate-950 hover:bg-amber-300 font-extrabold text-xs cursor-pointer shadow-sm"
+                >
+                  تمديد +5 د
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleExtendRestMinutes(emp.id, 10)}
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl bg-amber-300 text-slate-950 hover:bg-amber-200 font-extrabold text-xs cursor-pointer shadow-sm"
+                >
+                  تمديد +10 د
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleAcknowledgeAlarm(emp.id)}
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl bg-rose-800/80 hover:bg-rose-800 text-white font-bold text-xs flex items-center gap-1 cursor-pointer"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>كتم الصوت</span>
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-5">
-      {/* Top Header matching Reference Screen 10 */}
+      {/* Top Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold text-[#172B4D]">إدارة الاستراحات</h2>
@@ -927,7 +1582,19 @@ export const EmployeeRestManager: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setSubTab('add_employee')}
+            onClick={() => setConfirmNewDayModal(true)}
+            className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-white border border-[#E6EDF5] hover:border-[#2F80ED] text-[#172B4D] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+            title="بدء يوم عمل جديد وتصفير استهلاك اليوم"
+          >
+            <RotateCcw className="w-3.5 h-3.5 text-[#2F80ED]" />
+            <span>بدء يوم جديد</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setNewEmpError(null);
+              setSubTab('add_employee');
+            }}
             className="min-h-[40px] px-4 py-1.5 rounded-xl bg-[#1B365D] hover:bg-[#0F2342] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-2xs"
           >
             <Plus className="w-4 h-4" />
@@ -944,7 +1611,23 @@ export const EmployeeRestManager: React.FC = () => {
         </div>
       </div>
 
-      {/* Segmented Tabs matching Reference Screen 10: الموظفون | السجل */}
+      {/* Status Toast Notification */}
+      {statusToast && (
+        <div className="sm-card p-3.5 border-emerald-500/40 bg-[#E6F8EF] text-[#065F46] text-xs font-bold flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-[#10B981] shrink-0" />
+            <span>{statusToast}</span>
+          </div>
+          <button
+            onClick={() => setStatusToast(null)}
+            className="text-[#065F46] underline cursor-pointer"
+          >
+            إغلاق
+          </button>
+        </div>
+      )}
+
+      {/* Primary Segmented Switcher: الموظفون | السجل */}
       <div className="grid grid-cols-2 gap-1.5 p-1.5 bg-[#E6EDF5] rounded-2xl max-w-md">
         <button
           onClick={() => setSubTab('employees')}
@@ -968,55 +1651,184 @@ export const EmployeeRestManager: React.FC = () => {
         </button>
       </div>
 
-      {/* Shift Start Pre-Alert Banner */}
+      {/* Shift Start Pre-Alert Banner with Direct Interactive Start Rest Button */}
       {shiftAlertMessage && (
-        <div className="sm-card p-4 border-amber-400 bg-[#FFF8E6] flex items-center justify-between gap-4">
+        <div className="sm-card p-4 border-amber-400 bg-[#FFF8E6] flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3 text-xs font-bold text-[#92400E]">
             <BellRing className="w-5 h-5 text-[#F59E0B] shrink-0" />
-            <span>{shiftAlertMessage}</span>
+            <span>{shiftAlertMessage.text}</span>
           </div>
-          <button
-            onClick={() => setShiftAlertMessage(null)}
-            className="px-3 py-1.5 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
-          >
-            إغلاق
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                const emp = employees.find((e) => e.id === shiftAlertMessage.employeeId);
+                if (emp && !emp.activeSession) {
+                  executeStartRest(emp, shiftAlertMessage.allowanceMinutes);
+                }
+                setShiftAlertMessage(null);
+              }}
+              className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-[#10B981] hover:bg-[#059669] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>بدء الاستراحة</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShiftAlertMessage(null)}
+              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
+            >
+              إغلاق
+            </button>
+          </div>
         </div>
       )}
 
-      {/* LOUD PERSISTENT ALARM BANNER WHEN ANY REST HITS ZERO */}
-      {unacknowledgedExpiredEmployees.length > 0 && (
-        <div className="rounded-3xl border-2 border-rose-500 bg-rose-600 text-white p-6 shadow-xl space-y-4 animate-pulse">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <Volume2 className="w-8 h-8 text-white shrink-0" />
-              <div>
-                <h3 className="text-xl font-bold">
-                  انتهت استراحة {unacknowledgedExpiredEmployees.map((e) => e.name).join(' ، ')}!
-                </h3>
-                <p className="text-xs text-rose-100 mt-0.5">
-                  اضغط "تم" لإيقاف الصوت مع استمرار عدّاد التأخير الأحمر حتى يضغط الموظف "رجع".
-                </p>
+      {/* Interactive Start-Rest Notification Prompts (for employees who have not started rest yet) */}
+      {startRestPrompts.length > 0 && (
+        <div className="space-y-2.5">
+          {startRestPrompts.map((prompt) => {
+            const emp = employees.find((e) => e.id === prompt.employeeId);
+            if (!emp || emp.activeSession) return null;
+            return (
+              <div
+                key={prompt.employeeId}
+                className="rounded-3xl border-2 border-[#2F80ED] bg-[#EBF3FE] p-4 shadow-md flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2.5 py-0.5 rounded-lg bg-[#1B365D] text-white text-[10px] font-extrabold">
+                      إشعار تفاعلي لبدء الاستراحة · {prompt.createdAt}
+                    </span>
+                  </div>
+                  <p className="text-sm font-extrabold text-[#172B4D]">
+                    الموظف: {emp.name} — لم يبدأ استراحته بعد (الرصيد المتاح: {prompt.allowanceMinutes} دقيقة)
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => executeStartRest(emp, prompt.allowanceMinutes)}
+                    className="min-h-[42px] px-4 py-2 rounded-xl bg-[#10B981] hover:bg-[#059669] text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-xs"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    <span>بدء الاستراحة ({prompt.allowanceMinutes} د)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setStartRestPrompts((prev) =>
+                        prev.filter((p) => p.employeeId !== prompt.employeeId)
+                      )
+                    }
+                    className="min-h-[42px] px-3 py-2 rounded-xl bg-white text-[#6B7C93] hover:text-[#172B4D] text-xs font-bold cursor-pointer"
+                  >
+                    إغلاق
+                  </button>
+                </div>
               </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2.5">
-              {unacknowledgedExpiredEmployees.map((emp) => (
-                <button
-                  key={emp.id}
-                  onClick={() => handleAcknowledgeAlarm(emp.id)}
-                  className="min-h-[48px] px-5 py-2.5 rounded-2xl bg-white text-rose-700 font-bold text-sm flex items-center gap-2 shadow-md cursor-pointer"
-                >
-                  <Check className="w-5 h-5" />
-                  <span>تم — إيقاف صوت {emp.name}</span>
-                </button>
-              ))}
-            </div>
-          </div>
+            );
+          })}
         </div>
       )}
 
-      {/* BIG PERSISTENT ARABIC RETURN SUMMARY CARDS (Section 5) */}
+      {/* INTERACTIVE NOTIFICATION BANNER WHEN ANY EMPLOYEE REST ENDS OR OVERRUNS */}
+      {unacknowledgedExpiredEmployees.length > 0 && (
+        <div className="space-y-3">
+          {unacknowledgedExpiredEmployees.map((emp) => {
+            const sess = emp.activeSession!;
+            const metrics = calculateRestSessionMetrics({
+              startTimeMs: sess.startedAtMs,
+              allowedMinutes: sess.allocatedUnits,
+              nowMs,
+              unitMs: sess.unitMs,
+              isPaused: sess.isPaused,
+              pausedAtMs: sess.pausedAtMs,
+              totalPausedMs: sess.totalPausedMs,
+            });
+            const overtimeThreshold = settings.overtimeAlertAfterMinutes ?? 5;
+            const isOvertimeAlert = metrics.overtimeMinutes >= overtimeThreshold;
+            const delayLabel =
+              metrics.overtimeMinutes > 0
+                ? `${metrics.overtimeMinutes} دقيقة`
+                : `${Math.max(1, Math.ceil(metrics.overtimeMs / 1000))} ثانية`;
+
+            return (
+              <div
+                key={emp.id}
+                className="rounded-3xl border-2 border-rose-500 bg-rose-600 text-white p-5 shadow-xl space-y-4"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <Volume2 className="w-7 h-7 text-white shrink-0 mt-0.5 animate-bounce" />
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2.5 py-0.5 rounded-lg bg-white/20 text-[11px] font-extrabold">
+                          {isOvertimeAlert
+                            ? 'سبب التنبيه: الموظف متأخر عن الاستراحة'
+                            : 'سبب التنبيه: انتهت مدة الاستراحة'}
+                        </span>
+                        <span className="font-mono text-xs text-rose-100">
+                          المدة المخصصة: {sess.allocatedUnits} د · المنقضي: {metrics.elapsedMinutes} د
+                        </span>
+                      </div>
+                      <h3 className="text-lg sm:text-xl font-extrabold">
+                        الموظف: {emp.name} — مقدار التأخير الحالي: +{delayLabel}
+                      </h3>
+                      <p className="text-xs text-rose-100">
+                        اختر إجراءً فورياً من أزرار الإشعار أدناه لتسجيل عودة الموظف أو تمديد استراحته:
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Interactive Action Buttons inside Notification */}
+                <div className="flex flex-wrap items-center gap-2.5 pt-1 border-t border-white/20">
+                  <button
+                    type="button"
+                    onClick={() => handleEmployeeReturned(emp, false)}
+                    className="min-h-[46px] px-4 py-2 rounded-2xl bg-white text-emerald-800 hover:bg-emerald-50 font-extrabold text-xs sm:text-sm flex items-center gap-2 shadow-md cursor-pointer"
+                  >
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    <span>تمت العودة / إنهاء الاستراحة</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleExtendRestMinutes(emp.id, 5)}
+                    className="min-h-[46px] px-4 py-2 rounded-2xl bg-amber-400 text-slate-950 hover:bg-amber-300 font-extrabold text-xs sm:text-sm flex items-center gap-1.5 shadow-md cursor-pointer"
+                  >
+                    <Clock className="w-4 h-4" />
+                    <span>تمديد الاستراحة (+5 د)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleExtendRestMinutes(emp.id, 10)}
+                    className="min-h-[46px] px-4 py-2 rounded-2xl bg-amber-300 text-slate-950 hover:bg-amber-200 font-extrabold text-xs sm:text-sm flex items-center gap-1.5 shadow-md cursor-pointer"
+                  >
+                    <Clock className="w-4 h-4" />
+                    <span>تمديد الاستراحة (+10 د)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleAcknowledgeAlarm(emp.id)}
+                    className="min-h-[46px] px-4 py-2 rounded-2xl bg-rose-800/80 hover:bg-rose-800 text-white font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>كتم الصوت فقط</span>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* BIG PERSISTENT ARABIC RETURN SUMMARY CARDS */}
       {returnBannerMessages.length > 0 && (
         <div className="space-y-3">
           {returnBannerMessages.map((msg) => (
@@ -1057,399 +1869,437 @@ export const EmployeeRestManager: React.FC = () => {
       )}
 
       {/* =========================================================
-          VIEW 1: EMPLOYEES & TIMERS (Reference Screen 10)
+          VIEW 1: EMPLOYEES & 4 ORGANIZED SECTIONS
          ========================================================= */}
       {subTab === 'employees' && (
-        <div className="space-y-6">
-          {/* Top Queue: "لم يأخذوا الريست بعد" & "لهم رصيد متبقٍ" */}
-          <div className="sm-card p-5 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E6EDF5] pb-3.5">
-              <div>
-                <h3 className="text-base font-bold text-[#172B4D]">
-                  قائمة المتابعة: لم يأخذوا الريست بعد ولهم رصيد متبقٍ
-                </h3>
-                <p className="text-xs text-[#6B7C93]">
-                  اضغط مطولاً على اسم الموظف للبدء السريع بالرصيد المتبقي
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2.5 text-xs font-bold">
-                <span className="text-[#6B7C93]">
-                  لم يأخذ: <strong className="font-mono text-[#172B4D]">{statusCounts.grayNotTaken}</strong>
-                </span>
-                <span aria-hidden="true" className="text-[#CBD5E1]">·</span>
-                <span className="text-[#F59E0B]">
-                  رصيد متبقٍ: <strong className="font-mono">{statusCounts.orangePartial}</strong>
-                </span>
-                <span aria-hidden="true" className="text-[#CBD5E1]">·</span>
-                <span className="text-[#10B981]">
-                  أنهى: <strong className="font-mono">{statusCounts.greenFinished}</strong>
-                </span>
-                <span aria-hidden="true" className="text-[#CBD5E1]">·</span>
-                <span className="text-rose-600">
-                  متأخر: <strong className="font-mono">{statusCounts.redLate}</strong>
-                </span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Group 1: لم يبدؤوا أي استراحة اليوم */}
-              <div className="rounded-2xl bg-[#F8FAFC] border border-[#E6EDF5] p-4 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-[#172B4D]">
-                    1. لم يبدؤوا أي استراحة اليوم
-                  </span>
-                  <span className="font-mono text-xs font-bold text-[#6B7C93] bg-white px-2.5 py-0.5 rounded-lg border border-[#E6EDF5]">
-                    {notStartedEmployees.length}
-                  </span>
-                </div>
-
-                {notStartedEmployees.length === 0 ? (
-                  <p className="text-xs text-[#9AA5B1] py-3 text-center">
-                    الجميع بدأوا استراحاتهم اليوم.
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {notStartedEmployees.map((emp) => {
-                      const inRestNow = emp.activeSession !== null;
-                      return (
-                        <div
-                          key={emp.id}
-                          className="p-3 rounded-xl bg-white border border-[#E6EDF5] flex items-center justify-between gap-2"
-                        >
-                          <div
-                            onMouseDown={() => {
-                              if (!settings.enablePhase2Extras || inRestNow) return;
-                              longPressTimerRef.current = window.setTimeout(() => {
-                                requestStartRest(emp, getEmployeeRemainingUnits(emp));
-                              }, 600);
-                            }}
-                            onMouseUp={() => {
-                              if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-                            }}
-                            onTouchStart={() => {
-                              if (!settings.enablePhase2Extras || inRestNow) return;
-                              longPressTimerRef.current = window.setTimeout(() => {
-                                requestStartRest(emp, getEmployeeRemainingUnits(emp));
-                              }, 600);
-                            }}
-                            onTouchEnd={() => {
-                              if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-                            }}
-                            className="flex items-center gap-2.5 cursor-pointer select-none"
-                          >
-                            <div
-                              style={{ backgroundColor: emp.avatarColor || '#1B365D' }}
-                              className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center shrink-0"
-                            >
-                              {emp.name.slice(0, 1)}
-                            </div>
-                            <div>
-                              <span className="text-sm font-bold text-[#172B4D] block">
-                                {emp.name}
-                              </span>
-                              <span className="text-[11px] text-[#6B7C93]">
-                                الرصيد الكامل: {emp.dailyAllowanceMinutes} د
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
-                            {inRestNow ? (
-                              <span className="text-[11px] font-bold text-rose-600 bg-rose-50 px-2.5 py-1 rounded-lg">
-                                في استراحة
-                              </span>
-                            ) : (
-                              <>
-                                <button
-                                  onClick={() => openStartRestModal(emp)}
-                                  className="min-h-[36px] px-3 py-1 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
-                                >
-                                  بدء
-                                </button>
-                                <button
-                                  onClick={() => handleMarkSatisfied(emp.id)}
-                                  className="min-h-[36px] px-2.5 py-1 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
-                                >
-                                  اكتفى
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Group 2: لهم رصيد متبقٍ */}
-              <div className="rounded-2xl bg-[#F8FAFC] border border-[#E6EDF5] p-4 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-[#F59E0B]">
-                    2. لهم رصيد متبقٍ
-                  </span>
-                  <span className="font-mono text-xs font-bold text-[#F59E0B] bg-[#FFF4E5] px-2.5 py-0.5 rounded-lg">
-                    {partialRemainingEmployees.length}
-                  </span>
-                </div>
-
-                {partialRemainingEmployees.length === 0 ? (
-                  <p className="text-xs text-[#9AA5B1] py-3 text-center">
-                    لا يوجد موظفون برصيد جزئي متبقٍ حالياً.
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {partialRemainingEmployees.map((emp) => {
-                      const remUnits = getEmployeeRemainingUnits(emp);
-                      const inRestNow = emp.activeSession !== null;
-                      return (
-                        <div
-                          key={emp.id}
-                          className="p-3 rounded-xl bg-white border border-[#FDE68A] flex items-center justify-between gap-2"
-                        >
-                          <div className="flex items-center gap-2.5">
-                            <div
-                              style={{ backgroundColor: emp.avatarColor || '#F59E0B' }}
-                              className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center shrink-0"
-                            >
-                              {emp.name.slice(0, 1)}
-                            </div>
-                            <div>
-                              <span className="text-sm font-bold text-[#172B4D] block">
-                                {emp.name}
-                              </span>
-                              <span className="text-xs font-bold text-[#F59E0B]">
-                                متبقي {remUnits} دقائق
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
-                            {inRestNow ? (
-                              <span className="text-[11px] font-bold text-rose-600 bg-rose-50 px-2.5 py-1 rounded-lg">
-                                في استراحة
-                              </span>
-                            ) : (
-                              <>
-                                <button
-                                  onClick={() => openStartRestModal(emp)}
-                                  className="min-h-[36px] px-3 py-1 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
-                                >
-                                  خذ المتبقي ({remUnits} د)
-                                </button>
-                                <button
-                                  onClick={() => handleMarkSatisfied(emp.id)}
-                                  className="min-h-[36px] px-2.5 py-1 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
-                                >
-                                  اكتفى
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+        <div className="space-y-5">
+          {/* 4 Category Tabs Bar at the Top of the Employees List */}
+          <div className="sm-card p-2">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+              {categoryTabsMeta.map((tab) => {
+                const isSelected = activeCategoryTab === tab.id;
+                const isUrgentExceeded = tab.id === 'exceeded' && tab.count > 0;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setActiveCategoryTab(tab.id)}
+                    className={`min-h-[52px] px-3.5 py-2.5 rounded-2xl text-xs font-extrabold flex items-center justify-between gap-2 transition-all cursor-pointer ${
+                      isSelected
+                        ? 'bg-[#1B365D] text-white shadow-sm'
+                        : isUrgentExceeded
+                        ? 'bg-rose-50 text-rose-700 border border-rose-300 hover:bg-rose-100'
+                        : 'bg-[#F4F7FB] text-[#172B4D] hover:bg-[#E6EDF5]'
+                    }`}
+                  >
+                    <span className="truncate text-right">{tab.label}</span>
+                    <span
+                      className={`font-mono tabular-nums px-2.5 py-0.5 rounded-xl text-xs font-extrabold shrink-0 ${
+                        isSelected
+                          ? 'bg-white/20 text-white'
+                          : `${tab.badgeBg} ${tab.badgeText}`
+                      }`}
+                    >
+                      ({tab.count})
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           </div>
 
-          {/* Employee Cards List matching Reference Screen 10 */}
-          <div className="space-y-3">
-            {employees.map((emp) => {
-              const status = getEmployeeStatus(emp);
-              const remUnits = getEmployeeRemainingUnits(emp);
-              const unitSec = settings.testModeMinuteAsSecond ? 1 : 60;
-              const consumedUnits =
-                Math.round((emp.consumedSecondsToday / unitSec) * 10) / 10;
+          {/* Active Category Section Header */}
+          <div className="flex items-center justify-between px-1">
+            <div className="flex items-center gap-2">
+              <h3 className="text-base font-extrabold text-[#172B4D]">
+                {activeCategoryMeta.label}
+              </h3>
+              <span
+                className={`font-mono text-xs font-extrabold px-2.5 py-0.5 rounded-xl ${activeCategoryMeta.badgeBg} ${activeCategoryMeta.badgeText}`}
+              >
+                {activeCategoryMeta.count}
+              </span>
+            </div>
 
-              let timerDisplay = '00:00';
-              let isOvertime = false;
-              if (emp.activeSession) {
-                const sess = emp.activeSession;
-                const effectiveNow = sess.isPaused
-                  ? sess.pausedAtMs || nowMs
-                  : nowMs;
-                const diffMs = sess.targetEndMs - effectiveNow;
+            {categorizedEmployees.exceeded.length > 0 &&
+              activeCategoryTab !== 'exceeded' && (
+                <button
+                  onClick={() => setActiveCategoryTab('exceeded')}
+                  className="px-3 py-1.5 rounded-xl bg-rose-600 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer animate-pulse"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  <span>
+                    يوجد ({categorizedEmployees.exceeded.length}) في قسم تجاوز المدة
+                  </span>
+                </button>
+              )}
+          </div>
 
-                if (diffMs >= 0) {
-                  const totalSecsLeft = Math.ceil(diffMs / 1000);
-                  const m = Math.floor(totalSecsLeft / 60);
-                  const s = totalSecsLeft % 60;
-                  timerDisplay = `${String(m).padStart(2, '0')}:${String(s).padStart(
-                    2,
-                    '0'
-                  )}`;
-                } else {
-                  isOvertime = true;
-                  const overSecs = Math.floor(Math.abs(diffMs) / 1000);
-                  const m = Math.floor(overSecs / 60);
-                  const s = overSecs % 60;
-                  timerDisplay = `+${String(m).padStart(2, '0')}:${String(s).padStart(
-                    2,
-                    '0'
-                  )}`;
+          {/* Filtered Employees List for the Selected Category */}
+          {activeCategoryEmployees.length === 0 ? (
+            <div className="sm-card p-8 text-center space-y-3">
+              <p className="text-sm font-bold text-[#6B7C93]">
+                {activeCategoryMeta.emptyMessage}
+              </p>
+              {activeCategoryTab !== 'not_taken' &&
+                categorizedEmployees.not_taken.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveCategoryTab('not_taken')}
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-[#F0F4F9] hover:bg-[#E2E8F0] text-[#1B365D] text-xs font-bold cursor-pointer"
+                  >
+                    عرض الموظفين الذين لم يأخذوا استراحتهم ({categorizedEmployees.not_taken.length})
+                  </button>
+                )}
+            </div>
+          ) : (
+            <div className="space-y-3.5">
+              {activeCategoryEmployees.map((emp) => {
+                const detailedState = getEmployeeDetailedState(emp, nowMs);
+                const {
+                  allowanceMinutes,
+                  consumedMinutes: consumedUnits,
+                  remainingMinutes: remUnits,
+                  delayMinutes: totalDelayUnits,
+                } = calculateEmployeeBalance(emp);
+
+                const sessionMetrics = emp.activeSession
+                  ? calculateRestSessionMetrics({
+                      startTimeMs: emp.activeSession.startedAtMs,
+                      allowedMinutes: emp.activeSession.allocatedUnits,
+                      nowMs,
+                      unitMs: emp.activeSession.unitMs,
+                      isPaused: emp.activeSession.isPaused,
+                      pausedAtMs: emp.activeSession.pausedAtMs,
+                      totalPausedMs: emp.activeSession.totalPausedMs,
+                    })
+                  : null;
+
+                const isOvertime = sessionMetrics ? sessionMetrics.isExceeded : false;
+                const timerDisplay = sessionMetrics ? sessionMetrics.timerDisplay : '00:00';
+
+                // Format live overtime in clear Arabic without unit confusion
+                let overtimeFormattedArabic = '';
+                if (sessionMetrics && sessionMetrics.isExceeded) {
+                  if (sessionMetrics.unitMs === 1000) {
+                    const simOverMins = Math.max(1, sessionMetrics.overtimeMinutes);
+                    overtimeFormattedArabic = `${simOverMins} دقيقة`;
+                  } else if (sessionMetrics.overtimeMinutes > 0) {
+                    overtimeFormattedArabic = formatDurationArabic(
+                      Math.floor(sessionMetrics.overtimeMs / 1000)
+                    );
+                  } else {
+                    overtimeFormattedArabic = `${Math.max(
+                      1,
+                      Math.ceil(sessionMetrics.overtimeMs / 1000)
+                    )} ثانية`;
+                  }
                 }
-              }
 
-              return (
-                <div key={emp.id} className="sm-card p-5 space-y-4">
-                  {/* Top Row matching Reference Screen 10: Right Avatar + Name + Remaining | Left Status Badge + Actions */}
-                  <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div className="flex items-center gap-3.5">
-                      <div
-                        style={{ backgroundColor: emp.avatarColor || '#1B365D' }}
-                        className="w-12 h-12 rounded-full text-white font-bold text-base flex items-center justify-center shrink-0 shadow-xs"
-                      >
-                        {emp.name.slice(0, 1)}
-                      </div>
+                return (
+                  <div
+                    key={emp.id}
+                    className={`sm-card p-5 space-y-4 transition-all ${
+                      detailedState === 'active_exceeded'
+                        ? 'border-2 border-rose-500 bg-rose-50/30'
+                        : ''
+                    }`}
+                  >
+                    {/* Employee Card Top Row */}
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      {/* Right in RTL: Avatar + Name + Duration Details */}
+                      <div className="flex items-center gap-3.5">
+                        <div
+                          style={{ backgroundColor: emp.avatarColor || '#1B365D' }}
+                          className="w-12 h-12 rounded-full text-white font-bold text-base flex items-center justify-center shrink-0 shadow-xs"
+                        >
+                          {emp.name.slice(0, 1)}
+                        </div>
 
-                      <div>
-                        <h4 className="text-base font-bold text-[#172B4D]">
-                          {emp.name}
-                        </h4>
-                        <div className="text-xs font-semibold mt-0.5">
-                          {status === 'in_rest' || status === 'late' ? (
-                            <span className="text-rose-600">في استراحة</span>
-                          ) : status === 'finished' ? (
-                            <span className="text-[#10B981]">
-                              أنهى رصيده ({emp.dailyAllowanceMinutes} د)
+                        <div className="space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h4 className="text-base font-extrabold text-[#172B4D]">
+                              {emp.name}
+                            </h4>
+                            <span className="px-2.5 py-0.5 rounded-lg bg-[#F0F4F9] text-[#1B365D] font-mono text-xs font-bold">
+                              المدة المخصصة: {allowanceMinutes} د
                             </span>
-                          ) : (
-                            <span className="text-[#6B7C93]">
-                              متبقي {remUnits} دقيقة (استهلك {consumedUnits} د)
-                            </span>
-                          )}
+                          </div>
+
+                          {/* Clear Status Description per Section */}
+                          <div className="text-xs font-bold">
+                            {detailedState === 'not_started' && (
+                              <span className="text-[#6B7C93]">
+                                لم يبدأ الاستراحة بعد · الرصيد المتاح بالكامل ({allowanceMinutes} دقيقة)
+                              </span>
+                            )}
+
+                            {detailedState === 'active_in_progress' && sessionMetrics && (
+                              <span className="text-[#F59E0B]">
+                                استراحة جارية الآن ({sessionMetrics.allowedMinutes} د) — المنقضي{' '}
+                                {sessionMetrics.elapsedMinutes} د والمتبقي{' '}
+                                {sessionMetrics.remainingMinutes} د
+                              </span>
+                            )}
+
+                            {detailedState === 'ended_early_partial' && (
+                              <span className="text-[#F59E0B]">
+                                أنهى استراحة مبكراً (استهلك {consumedUnits} د) · متبقي له{' '}
+                                <strong className="font-mono text-[#172B4D]">{remUnits} دقيقة</strong>
+                              </span>
+                            )}
+
+                            {detailedState === 'active_exceeded' && sessionMetrics && (
+                              <span className="text-rose-600">
+                                متأخر عن موعد انتهاء استراحته ({sessionMetrics.allowedMinutes} د) بمقدار{' '}
+                                <strong>{overtimeFormattedArabic}</strong>
+                              </span>
+                            )}
+
+                            {detailedState === 'completed_full' && (
+                              <span className="text-[#10B981]">
+                                أنهى مدة استراحته المطلوبة بالكامل ({consumedUnits} د من {allowanceMinutes} د)
+                                {totalDelayUnits > 0 ? ` · تأخير مسجل: ${totalDelayUnits} د` : ''}
+                              </span>
+                            )}
+
+                            {detailedState === 'completed_early_approved' && (
+                              <span className="text-[#10B981]">
+                                أنهى استراحته باعتماد الاكتفاء (استهلك {consumedUnits} د من {allowanceMinutes} د)
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    <div className="flex items-center gap-2">
-                      {/* Status indicator matching Screen 10 */}
-                      <span
-                        className={`px-3 py-1 rounded-xl text-xs font-bold ${
-                          status === 'late' || status === 'in_rest'
-                            ? 'bg-rose-50 text-rose-600'
-                            : 'bg-[#E6F8EF] text-[#10B981]'
-                        }`}
-                      >
-                        {status === 'late'
-                          ? 'متأخر'
-                          : status === 'in_rest'
-                          ? 'غير متاح'
-                          : 'متاح'}
-                      </span>
-
-                      {!emp.activeSession && (
-                        <button
-                          onClick={() => openStartRestModal(emp)}
-                          className="min-h-[38px] px-4 py-1.5 rounded-xl bg-[#1B365D] hover:bg-[#0F2342] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                      {/* Left in RTL: Status Badge + Primary Action Buttons */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* Status Pill */}
+                        <span
+                          className={`px-3 py-1 rounded-xl text-xs font-extrabold ${
+                            detailedState === 'active_exceeded'
+                              ? 'bg-rose-100 text-rose-700'
+                              : detailedState === 'active_in_progress'
+                              ? 'bg-[#FFF4E5] text-[#B45309]'
+                              : detailedState === 'ended_early_partial'
+                              ? 'bg-[#FFF4E5] text-[#D97706]'
+                              : detailedState === 'completed_full' ||
+                                detailedState === 'completed_early_approved'
+                              ? 'bg-[#E6F8EF] text-[#10B981]'
+                              : 'bg-[#EBF3FE] text-[#2F80ED]'
+                          }`}
                         >
-                          <Play className="w-3.5 h-3.5" />
-                          <span>بدء استراحة</span>
-                        </button>
-                      )}
-
-                      <button
-                        onClick={() => setEditingEmployee({ ...emp })}
-                        className="p-2 rounded-xl bg-[#F0F4F9] hover:bg-[#E2E8F0] text-[#6B7C93] cursor-pointer"
-                        title="تعديل الموظف"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-
-                      <button
-                        onClick={() => setDeletingEmployee(emp)}
-                        className="p-2 rounded-xl bg-[#F0F4F9] hover:bg-rose-50 text-[#6B7C93] hover:text-rose-600 cursor-pointer"
-                        title="حذف الموظف"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Active Timer Box if Employee is in Rest */}
-                  {emp.activeSession && (
-                    <div className="rounded-2xl bg-[#F4F7FB] border border-[#E6EDF5] p-4 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-[#6B7C93]">
-                          {isOvertime
-                            ? 'عدّاد التأخير والتجاوز:'
-                            : `الوقت المتبقي من الاستراحة (${emp.activeSession.allocatedUnits} د):`}
+                          {detailedState === 'active_exceeded'
+                            ? 'تجاوز المدة'
+                            : detailedState === 'active_in_progress'
+                            ? 'في استراحة جارية'
+                            : detailedState === 'ended_early_partial'
+                            ? `متبقي ${remUnits} د`
+                            : detailedState === 'completed_full' ||
+                              detailedState === 'completed_early_approved'
+                            ? 'أنهى استراحته'
+                            : 'لم يبدأ'}
                         </span>
-                        {isOvertime && !emp.activeSession.alarmAcknowledged && (
-                          <button
-                            onClick={() => handleAcknowledgeAlarm(emp.id)}
-                            className="px-3 py-1 rounded-lg bg-rose-600 text-white text-xs font-bold cursor-pointer"
-                          >
-                            تم (إيقاف الصوت)
-                          </button>
+
+                        {/* Start / Resume Remaining Rest Button */}
+                        {!emp.activeSession && detailedState === 'not_started' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openStartRestModal(emp)}
+                              className="min-h-[38px] px-4 py-1.5 rounded-xl bg-[#1B365D] hover:bg-[#0F2342] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                            >
+                              <Play className="w-3.5 h-3.5" />
+                              <span>بدء الاستراحة</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleSendStartRestNotification(emp)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#EBF3FE] hover:bg-[#DBEAFE] text-[#1B365D] text-xs font-bold flex items-center gap-1 cursor-pointer"
+                              title="إرسال إشعار تذكير ببدء الاستراحة مع زر بدء الاستراحة التفاعلي"
+                            >
+                              <Bell className="w-3.5 h-3.5 text-[#2F80ED]" />
+                              <span>إشعار بدء</span>
+                            </button>
+                          </>
                         )}
-                      </div>
 
-                      <div
-                        dir="ltr"
-                        className={`font-mono tabular-nums text-4xl font-bold text-center py-1 ${
-                          isOvertime ? 'text-rose-600' : 'text-[#1B365D]'
-                        }`}
-                      >
-                        {timerDisplay}
-                      </div>
+                        {!emp.activeSession && detailedState === 'ended_early_partial' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openStartRestModal(emp)}
+                              className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-[#1B365D] hover:bg-[#0F2342] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <Play className="w-3.5 h-3.5" />
+                              <span>استكمال المتبقي ({remUnits} د)</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleMarkSatisfied(emp.id)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#E6F8EF] hover:bg-[#D1F2E1] text-[#065F46] text-xs font-bold cursor-pointer"
+                              title="اعتماد إنهاء الاستراحة مبكراً ونقل الموظف إلى قسم أنهوا استراحتهم"
+                            >
+                              اعتماد الاكتفاء
+                            </button>
+                          </>
+                        )}
 
-                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
-                        <button
-                          onClick={() => handleEmployeeReturned(emp)}
-                          className="sm:col-span-2 min-h-[44px] rounded-xl bg-[#22C55E] hover:bg-[#16A34A] text-white font-bold text-sm flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
-                        >
-                          <CheckCircle2 className="w-4 h-4" />
-                          <span>رجع من الاستراحة</span>
-                        </button>
-
-                        <button
-                          onClick={() => handleTogglePause(emp.id)}
-                          className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] text-[#172B4D] text-xs font-bold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          {emp.activeSession.isPaused ? (
+                        {!emp.activeSession &&
+                          (detailedState === 'completed_full' ||
+                            detailedState === 'completed_early_approved') && (
                             <>
-                              <Play className="w-3.5 h-3.5 text-[#2F80ED]" />
-                              <span>استئناف</span>
-                            </>
-                          ) : (
-                            <>
-                              <Pause className="w-3.5 h-3.5 text-[#F59E0B]" />
-                              <span>إيقاف مؤقت</span>
+                              {detailedState === 'completed_early_approved' && remUnits > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleReopenIncomplete(emp.id)}
+                                  className="min-h-[36px] px-3 py-1 rounded-xl bg-[#F0F4F9] text-[#1B365D] text-xs font-bold cursor-pointer"
+                                >
+                                  إرجاع للمتبقي ({remUnits} د)
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => openStartRestModal(emp)}
+                                className="min-h-[36px] px-3 py-1 rounded-xl bg-[#F0F4F9] hover:bg-[#E2E8F0] text-[#172B4D] text-xs font-bold flex items-center gap-1 cursor-pointer"
+                              >
+                                <Play className="w-3 h-3" />
+                                <span>استراحة إضافية</span>
+                              </button>
                             </>
                           )}
+
+                        {/* Explicit Button: تعديل مدة الاستراحة */}
+                        <button
+                          type="button"
+                          onClick={() => openEditEmployeeModal(emp)}
+                          className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#F0F4F9] hover:bg-[#E2E8F0] text-[#1B365D] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                          title="تعديل مدة الاستراحة أو اسم الموظف"
+                        >
+                          <Edit3 className="w-3.5 h-3.5 text-[#2F80ED]" />
+                          <span>تعديل مدة الاستراحة</span>
                         </button>
 
-                        <div className="grid grid-cols-2 gap-1.5">
-                          <button
-                            onClick={() => handleAddFiveMinutes(emp.id)}
-                            className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] text-[#2F80ED] text-xs font-bold cursor-pointer"
-                          >
-                            +5 د
-                          </button>
-                          <button
-                            onClick={() => handleCancelRest(emp.id)}
-                            className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] text-rose-600 text-xs font-bold cursor-pointer"
-                          >
-                            إلغاء
-                          </button>
-                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setDeletingEmployee(emp)}
+                          className="min-h-[38px] min-w-[38px] rounded-xl bg-[#F0F4F9] hover:bg-rose-50 text-[#6B7C93] hover:text-rose-600 flex items-center justify-center cursor-pointer"
+                          title="حذف الموظف"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
                       </div>
                     </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+
+                    {/* Active Timer Box (Shown in Section 3 'incomplete' and Section 4 'exceeded') */}
+                    {emp.activeSession && sessionMetrics && (
+                      <div
+                        className={`rounded-2xl border p-4 space-y-3 ${
+                          isOvertime
+                            ? 'bg-rose-50/90 border-rose-300'
+                            : 'bg-[#F4F7FB] border-[#E6EDF5]'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span
+                            className={`text-xs font-bold ${
+                              isOvertime ? 'text-rose-700' : 'text-[#6B7C93]'
+                            }`}
+                          >
+                            {isOvertime
+                              ? `عدّاد التجاوز والتأخير (المدة المخصصة كانت ${sessionMetrics.allowedMinutes} د):`
+                              : `الوقت المتبقي لإتمام الاستراحة (${sessionMetrics.allowedMinutes} د):`}
+                          </span>
+
+                          {isOvertime && !emp.activeSession.alarmAcknowledged && (
+                            <button
+                              type="button"
+                              onClick={() => handleAcknowledgeAlarm(emp.id)}
+                              className="px-3 py-1 rounded-lg bg-rose-600 text-white text-xs font-bold cursor-pointer"
+                            >
+                              تم (إيقاف الصوت)
+                            </button>
+                          )}
+                        </div>
+
+                        <div
+                          dir="ltr"
+                          className={`font-mono tabular-nums text-4xl font-bold text-center py-1 ${
+                            isOvertime ? 'text-rose-600' : 'text-[#1B365D]'
+                          }`}
+                        >
+                          {timerDisplay}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleEmployeeReturned(emp, false)}
+                            className="sm:col-span-2 min-h-[44px] rounded-xl bg-[#22C55E] hover:bg-[#16A34A] text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
+                          >
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span>
+                              {isOvertime
+                                ? 'رجع — إنهاء وتسجيل التأخير'
+                                : 'رجع من الاستراحة'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleTogglePause(emp.id)}
+                            className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] text-[#172B4D] text-xs font-bold flex items-center justify-center gap-1 cursor-pointer"
+                          >
+                            {emp.activeSession.isPaused ? (
+                              <>
+                                <Play className="w-3.5 h-3.5 text-[#2F80ED]" />
+                                <span>استئناف</span>
+                              </>
+                            ) : (
+                              <>
+                                <Pause className="w-3.5 h-3.5 text-[#F59E0B]" />
+                                <span>إيقاف مؤقت</span>
+                              </>
+                            )}
+                          </button>
+
+                          <div className="sm:col-span-2 grid grid-cols-3 gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleExtendRestMinutes(emp.id, 5)}
+                              className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] hover:border-[#2F80ED] text-[#2F80ED] text-xs font-bold cursor-pointer"
+                            >
+                              +5 د
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleExtendRestMinutes(emp.id, 10)}
+                              className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] hover:border-[#2F80ED] text-[#1B365D] text-xs font-bold cursor-pointer"
+                            >
+                              +10 د
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleCancelRest(emp.id)}
+                              className="min-h-[44px] rounded-xl bg-white border border-[#E6EDF5] text-rose-600 text-xs font-bold cursor-pointer"
+                            >
+                              إلغاء
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
       {/* =========================================================
-          VIEW 2: ADD EMPLOYEE SCREEN (Reference Screen 11)
+          VIEW 2: ADD EMPLOYEE SCREEN (With Custom Duration Input)
          ========================================================= */}
       {subTab === 'add_employee' && (
         <div className="max-w-lg mx-auto sm-card p-6 space-y-5">
@@ -1473,9 +2323,15 @@ export const EmployeeRestManager: React.FC = () => {
           </div>
 
           <form onSubmit={handleAddSingleEmployee} className="space-y-5">
+            {newEmpError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold">
+                {newEmpError}
+              </div>
+            )}
+
             <div className="space-y-1.5">
               <label className="block text-xs font-bold text-[#172B4D]">
-                إسم الموظف
+                اسم الموظف
               </label>
               <input
                 type="text"
@@ -1487,21 +2343,41 @@ export const EmployeeRestManager: React.FC = () => {
               />
             </div>
 
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               <label className="block text-xs font-bold text-[#172B4D]">
-                مدة الاستراحة اليومية
+                مدة الاستراحة اليومية (بالدقائق)
               </label>
-              <select
-                value={newEmpAllowance}
-                onChange={(e) => setNewEmpAllowance(Number(e.target.value))}
-                className="w-full min-h-[48px] sm-input px-4 text-sm font-bold"
-              >
-                <option value={15}>15 دقيقة</option>
-                <option value={20}>20 دقيقة</option>
-                <option value={30}>30 دقيقة (الافتراضي)</option>
-                <option value={45}>45 دقيقة</option>
-                <option value={60}>60 دقيقة</option>
-              </select>
+              <div className="flex flex-wrap gap-1.5">
+                {QUICK_DURATION_PRESETS.map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => {
+                      setNewEmpAllowanceText(String(mins));
+                      setNewEmpError(null);
+                    }}
+                    className={`min-h-[38px] px-3 py-1 rounded-xl font-mono text-xs font-bold transition-colors cursor-pointer ${
+                      normalizeDigitsToAscii(newEmpAllowanceText) === String(mins)
+                        ? 'bg-[#1B365D] text-white'
+                        : 'bg-[#F0F4F9] text-[#172B4D] hover:bg-[#E2E8F0]'
+                    }`}
+                  >
+                    {mins} د
+                  </button>
+                ))}
+              </div>
+              <input
+                type="text"
+                inputMode="numeric"
+                dir="ltr"
+                placeholder="أدخل مدة مخصصة (مثلاً 25)"
+                value={newEmpAllowanceText}
+                onChange={(e) => {
+                  setNewEmpAllowanceText(normalizeDigitsToAscii(e.target.value));
+                  setNewEmpError(null);
+                }}
+                className="w-full min-h-[48px] sm-input px-4 font-mono text-base font-bold text-center"
+              />
             </div>
 
             <div className="space-y-2">
@@ -1591,7 +2467,7 @@ export const EmployeeRestManager: React.FC = () => {
       )}
 
       {/* =========================================================
-          VIEW 4: REST SETTINGS & BACKUP
+          VIEW 4: REST SETTINGS, INTERACTIVE NOTIFICATIONS & BACKUP
          ========================================================= */}
       {subTab === 'settings' && (
         <div className="sm-card p-6 space-y-5">
@@ -1604,7 +2480,7 @@ export const EmployeeRestManager: React.FC = () => {
               <ChevronRight className="w-5 h-5" />
               <span>رجوع</span>
             </button>
-            <h3 className="text-lg font-bold text-[#172B4D]">إعدادات الاستراحات</h3>
+            <h3 className="text-lg font-bold text-[#172B4D]">إعدادات الاستراحات والإشعارات</h3>
             <button
               type="button"
               onClick={() => setConfirmNewDayModal(true)}
@@ -1612,6 +2488,95 @@ export const EmployeeRestManager: React.FC = () => {
             >
               بدء يوم جديد
             </button>
+          </div>
+
+          {/* Interactive Notifications Configuration Card */}
+          <div className="p-4 rounded-2xl bg-[#EBF3FE]/60 border border-[#2F80ED]/30 space-y-3.5">
+            <div className="flex items-center gap-2">
+              <BellRing className="w-4 h-4 text-[#2F80ED]" />
+              <h4 className="text-sm font-extrabold text-[#172B4D]">
+                إعدادات إشعارات الاستراحة التفاعلية (انتهاء المدة والتأخير)
+              </h4>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <label className="flex items-center justify-between p-3 rounded-xl bg-white border border-[#E6EDF5] cursor-pointer">
+                <div>
+                  <span className="text-xs font-bold text-[#172B4D] block">
+                    إشعار انتهاء مدة الاستراحة
+                  </span>
+                  <span className="text-[11px] text-[#6B7C93]">
+                    يرسل إشعاراً تفاعلياً مع أزرار (تمت العودة / تمديد +5د / +10د) فور انتهاء المدة
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.notifyOnRestEnd !== false}
+                  onChange={(e) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifyOnRestEnd: e.target.checked,
+                    }))
+                  }
+                  className="w-4 h-4 accent-[#1B365D] shrink-0"
+                />
+              </label>
+
+              <label className="flex items-center justify-between p-3 rounded-xl bg-white border border-[#E6EDF5] cursor-pointer">
+                <div>
+                  <span className="text-xs font-bold text-[#172B4D] block">
+                    إشعار تأخير الموظف عن العودة
+                  </span>
+                  <span className="text-[11px] text-[#6B7C93]">
+                    يرسل إشعار تأخير إضافي إذا لم يسجل الموظف عودته بعد المدة المحددة
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.notifyOnOvertime !== false}
+                  onChange={(e) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifyOnOvertime: e.target.checked,
+                    }))
+                  }
+                  className="w-4 h-4 accent-[#1B365D] shrink-0"
+                />
+              </label>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-white border border-[#E6EDF5] flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <span className="text-xs font-bold text-[#172B4D] block">
+                  إرسال إشعار التأخير بعد مرور (دقائق من انتهاء الاستراحة):
+                </span>
+                <span className="text-[11px] text-[#6B7C93]">
+                  لا يُرسل إشعار التأخير إذا سجل الموظف عودته قبل هذا الوقت
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                {[1, 3, 5, 10, 15].map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        overtimeAlertAfterMinutes: mins,
+                      }))
+                    }
+                    className={`min-h-[36px] px-3 py-1 rounded-xl font-mono text-xs font-bold cursor-pointer transition-colors ${
+                      (settings.overtimeAlertAfterMinutes ?? 5) === mins
+                        ? 'bg-[#1B365D] text-white'
+                        : 'bg-[#F0F4F9] text-[#172B4D] hover:bg-[#E2E8F0]'
+                    }`}
+                  >
+                    {mins} د
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1727,12 +2692,19 @@ export const EmployeeRestManager: React.FC = () => {
                 بدء استراحة: {startingEmployee.name}
               </h3>
               <button
+                type="button"
                 onClick={() => setStartingEmployee(null)}
                 className="w-9 h-9 rounded-xl bg-[#F0F4F9] text-[#6B7C93] flex items-center justify-center cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
+
+            {startModalError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold">
+                {startModalError}
+              </div>
+            )}
 
             <div className="p-3.5 rounded-2xl bg-[#F4F7FB] border border-[#E6EDF5] flex items-center justify-between text-xs font-bold">
               <span className="text-[#6B7C93]">الرصيد المتبقي اليوم:</span>
@@ -1743,6 +2715,7 @@ export const EmployeeRestManager: React.FC = () => {
 
             {getEmployeeRemainingUnits(startingEmployee) > 0 && (
               <button
+                type="button"
                 onClick={() =>
                   requestStartRest(
                     startingEmployee,
@@ -1762,13 +2735,16 @@ export const EmployeeRestManager: React.FC = () => {
               <span className="text-xs font-bold text-[#6B7C93] block">
                 أو اختر مدة سريعة (بالدقائق):
               </span>
-              <div className="grid grid-cols-5 gap-2">
-                {[5, 10, 15, 20, 30].map((mins) => (
+              <div className="grid grid-cols-6 gap-1.5">
+                {[5, 10, 15, 20, 25, 30].map((mins) => (
                   <button
                     key={mins}
                     type="button"
-                    onClick={() => requestStartRest(startingEmployee, mins)}
-                    className="min-h-[44px] rounded-xl bg-[#F0F4F9] hover:bg-[#1B365D] hover:text-white text-[#172B4D] font-mono font-bold text-sm transition-colors cursor-pointer"
+                    onClick={() => {
+                      setCustomMinutesText(String(mins));
+                      requestStartRest(startingEmployee, mins);
+                    }}
+                    className="min-h-[42px] rounded-xl bg-[#F0F4F9] hover:bg-[#1B365D] hover:text-white text-[#172B4D] font-mono font-bold text-xs transition-colors cursor-pointer"
                   >
                     {mins}
                   </button>
@@ -1777,28 +2753,29 @@ export const EmployeeRestManager: React.FC = () => {
             </div>
 
             <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                requestStartRest(startingEmployee, Number(customMinutesInput) || 5);
-              }}
-              className="pt-2 border-t border-[#E6EDF5] flex items-end gap-2.5"
+              onSubmit={handleStartWithCustomInput}
+              className="pt-3 border-t border-[#E6EDF5] flex items-end gap-2.5"
             >
               <div className="flex-1 space-y-1">
                 <label className="block text-xs font-bold text-[#6B7C93]">
-                  مدة مخصصة (دقائق):
+                  مدة مخصصة (تقبل الأرقام العربية والإنجليزية مثل 25 أو ٢٥):
                 </label>
                 <input
-                  type="number"
-                  min={1}
-                  max={180}
-                  value={customMinutesInput}
-                  onChange={(e) => setCustomMinutesInput(Number(e.target.value))}
-                  className="w-full min-h-[44px] sm-input px-3.5 font-mono font-bold text-sm"
+                  type="text"
+                  inputMode="numeric"
+                  dir="ltr"
+                  placeholder="25"
+                  value={customMinutesText}
+                  onChange={(e) => {
+                    setCustomMinutesText(normalizeDigitsToAscii(e.target.value));
+                    setStartModalError(null);
+                  }}
+                  className="w-full min-h-[44px] sm-input px-3.5 font-mono font-bold text-base text-center"
                 />
               </div>
               <button
                 type="submit"
-                className="min-h-[44px] px-5 rounded-xl bg-[#2F80ED] text-white font-bold text-xs cursor-pointer"
+                className="min-h-[44px] px-5 rounded-xl bg-[#2F80ED] hover:bg-[#1B365D] text-white font-bold text-xs cursor-pointer transition-colors"
               >
                 بدء بالمخصص
               </button>
@@ -1841,12 +2818,14 @@ export const EmployeeRestManager: React.FC = () => {
 
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
+                type="button"
                 onClick={() => setConfirmExceedModal(null)}
                 className="min-h-[42px] px-4 py-2 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
               >
                 إلغاء
               </button>
               <button
+                type="button"
                 onClick={() =>
                   executeStartRest(
                     confirmExceedModal.employee,
@@ -1903,46 +2882,104 @@ export const EmployeeRestManager: React.FC = () => {
       )}
 
       {/* =========================================================
-          MODAL 4: EDIT EMPLOYEE
+          MODAL 4: EDIT EMPLOYEE & REST DURATION
          ========================================================= */}
-      {editingEmployee && (
+      {editingEmployeeId && editingEmployeeObj && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
           <form
             onSubmit={handleSaveEditedEmployee}
-            className="w-full max-w-md rounded-3xl bg-white border border-[#E6EDF5] p-6 shadow-2xl space-y-4 text-[#172B4D]"
+            className="w-full max-w-md rounded-3xl bg-white border border-[#E6EDF5] p-6 shadow-2xl space-y-5 text-[#172B4D]"
           >
-            <h3 className="text-lg font-bold">تعديل بيانات الموظف</h3>
+            <div className="flex items-center justify-between border-b border-[#E6EDF5] pb-3">
+              <h3 className="text-lg font-extrabold text-[#172B4D]">
+                تعديل مدة الاستراحة وبيانات الموظف
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingEmployeeId(null)}
+                className="w-9 h-9 rounded-xl bg-[#F0F4F9] text-[#6B7C93] flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
 
-            <div className="space-y-1">
-              <label className="block text-xs font-bold text-[#6B7C93]">اسم الموظف</label>
+            {editModalError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold">
+                {editModalError}
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-bold text-[#6B7C93]">
+                اسم الموظف
+              </label>
               <input
                 type="text"
                 required
-                value={editingEmployee.name}
-                onChange={(e) =>
-                  setEditingEmployee({ ...editingEmployee, name: e.target.value })
-                }
+                value={editEmpName}
+                onChange={(e) => {
+                  setEditEmpName(e.target.value);
+                  setEditModalError(null);
+                }}
                 className="w-full min-h-[44px] sm-input px-3.5 text-sm font-bold"
               />
             </div>
 
-            <div className="space-y-1">
-              <label className="block text-xs font-bold text-[#6B7C93]">
-                رصيد الاستراحة اليومي (دقائق)
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={240}
-                value={editingEmployee.dailyAllowanceMinutes}
-                onChange={(e) =>
-                  setEditingEmployee({
-                    ...editingEmployee,
-                    dailyAllowanceMinutes: Math.max(1, Number(e.target.value) || 30),
-                  })
-                }
-                className="w-full min-h-[44px] sm-input px-3.5 font-mono font-bold text-sm"
-              />
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <label className="block text-xs font-bold text-[#172B4D]">
+                  مدة الاستراحة المخصصة (بالدقائق)
+                </label>
+                <span className="text-[11px] font-bold text-[#2F80ED]">
+                  المحفوظة حالياً: {editingEmployeeObj.dailyAllowanceMinutes} د
+                </span>
+              </div>
+
+              {/* Preset Options */}
+              <div className="flex flex-wrap gap-1.5">
+                {QUICK_DURATION_PRESETS.map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => {
+                      setEditAllowanceText(String(mins));
+                      setEditModalError(null);
+                    }}
+                    className={`min-h-[38px] px-3 py-1 rounded-xl font-mono text-xs font-bold transition-colors cursor-pointer ${
+                      normalizeDigitsToAscii(editAllowanceText) === String(mins)
+                        ? 'bg-[#1B365D] text-white shadow-2xs'
+                        : 'bg-[#F0F4F9] text-[#172B4D] hover:bg-[#E2E8F0]'
+                    }`}
+                  >
+                    {mins} د
+                  </button>
+                ))}
+              </div>
+
+              {/* Custom Manual Numeric Input (Supports English 25, Arabic ٢٥, Persian ۲۵) */}
+              <div className="space-y-1">
+                <span className="block text-[11px] font-semibold text-[#6B7C93]">
+                  أو اكتب مدة مخصصة يدوياً (1 إلى 240 دقيقة):
+                </span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  dir="ltr"
+                  placeholder="مثال: 25"
+                  value={editAllowanceText}
+                  onChange={(e) => {
+                    setEditAllowanceText(normalizeDigitsToAscii(e.target.value));
+                    setEditModalError(null);
+                  }}
+                  className="w-full min-h-[48px] sm-input px-4 font-mono font-extrabold text-lg text-center text-[#1B365D]"
+                />
+              </div>
+
+              {editingEmployeeObj.activeSession && (
+                <p className="text-[11px] text-[#B45309] bg-[#FFF4E5] p-2.5 rounded-xl font-semibold">
+                  ملاحظة: لدى هذا الموظف استراحة جارية حالياً؛ سيتم تحديث المدة المخصصة وإعادة حساب الوقت المتبقي أو التأخير تلقائياً مع الحفاظ على وقت بداية الاستراحة الفعلي.
+                </p>
+              )}
             </div>
 
             <div className="space-y-1.5">
@@ -1953,12 +2990,10 @@ export const EmployeeRestManager: React.FC = () => {
                     <button
                       key={hex}
                       type="button"
-                      onClick={() =>
-                        setEditingEmployee({ ...editingEmployee, avatarColor: hex })
-                      }
+                      onClick={() => setEditEmpColor(hex)}
                       style={{ backgroundColor: hex }}
                       className={`w-8 h-8 rounded-full cursor-pointer ${
-                        editingEmployee.avatarColor === hex
+                        editEmpColor === hex
                           ? 'ring-2 ring-[#1B365D] ring-offset-2'
                           : ''
                       }`}
@@ -1968,19 +3003,35 @@ export const EmployeeRestManager: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-3 pt-2">
+            {/* Per-employee reset option if supervisor wants to reset today's state for this employee */}
+            {(editingEmployeeObj.consumedSecondsToday > 0 ||
+              editingEmployeeObj.delaySecondsToday > 0 ||
+              editingEmployeeObj.activeSession !== null) && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleResetSingleEmployeeToday(editingEmployeeObj.id)}
+                  className="w-full min-h-[38px] px-3 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-900 text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>إعادة ضبط استراحة ورصيد هذا الموظف لليوم</span>
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-[#E6EDF5]">
               <button
                 type="button"
-                onClick={() => setEditingEmployee(null)}
-                className="min-h-[42px] px-4 py-2 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
+                onClick={() => setEditingEmployeeId(null)}
+                className="min-h-[44px] px-4 py-2 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
               >
                 إلغاء
               </button>
               <button
                 type="submit"
-                className="min-h-[42px] px-5 py-2 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
+                className="min-h-[44px] px-6 py-2 rounded-xl bg-[#1B365D] hover:bg-[#0F2342] text-white text-xs font-bold cursor-pointer shadow-xs"
               >
-                حفظ
+                حفظ المدة والتعديلات
               </button>
             </div>
           </form>
@@ -1999,12 +3050,14 @@ export const EmployeeRestManager: React.FC = () => {
             </p>
             <div className="flex items-center justify-end gap-3">
               <button
+                type="button"
                 onClick={() => setDeletingEmployee(null)}
                 className="min-h-[40px] px-4 py-2 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
               >
                 تراجع
               </button>
               <button
+                type="button"
                 onClick={handleConfirmDeleteEmployee}
                 className="min-h-[40px] px-5 py-2 rounded-xl bg-rose-600 text-white text-xs font-bold cursor-pointer"
               >
@@ -2023,16 +3076,18 @@ export const EmployeeRestManager: React.FC = () => {
           <div className="w-full max-w-sm rounded-3xl bg-white border border-[#E6EDF5] p-6 shadow-2xl space-y-4 text-[#172B4D]">
             <h3 className="text-lg font-bold">تأكيد بدء يوم عمل جديد</h3>
             <p className="text-xs text-[#6B7C93] leading-relaxed">
-              سيتم تصفير استهلاك اليوم وإعادة الرصيد اليومي الكامل لجميع الموظفين. هل تريد المتابعة؟
+              سيتم تصفير استهلاك اليوم وإعادة الرصيد اليومي الكامل لجميع الموظفين ونقلهم إلى قسم «لم يأخذوا استراحتهم». هل تريد المتابعة؟
             </p>
             <div className="flex items-center justify-end gap-3">
               <button
+                type="button"
                 onClick={() => setConfirmNewDayModal(false)}
                 className="min-h-[40px] px-4 py-2 rounded-xl bg-[#F0F4F9] text-[#6B7C93] text-xs font-bold cursor-pointer"
               >
                 إلغاء
               </button>
               <button
+                type="button"
                 onClick={handleStartNewDayNow}
                 className="min-h-[40px] px-5 py-2 rounded-xl bg-[#1B365D] text-white text-xs font-bold cursor-pointer"
               >

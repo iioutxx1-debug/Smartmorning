@@ -51,7 +51,7 @@ export const LiveClockHero: React.FC<LiveClockHeroProps> = ({
 
     if (!closestAlarm || minDiffMs === Infinity) return null;
 
-    const totalMinutes = Math.floor(minDiffMs / 60000);
+    const totalMinutes = Math.max(1, Math.ceil(minDiffMs / 60000));
     const hoursLeft = Math.floor(totalMinutes / 60);
     const minsLeft = totalMinutes % 60;
 
@@ -222,8 +222,6 @@ export const LiveClockHero: React.FC<LiveClockHeroProps> = ({
                     gradualFadeSeconds: 30,
                     sound: 'fajr_adhan_tone',
                     challenge: 'math',
-                    linkedRoutinePresetId: 'energized_45',
-                    autoLaunchRoutine: true,
                   }
               )
             }

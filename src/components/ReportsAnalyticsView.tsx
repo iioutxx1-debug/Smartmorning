@@ -1,28 +1,22 @@
 import React, { useState, useMemo } from 'react';
-import { Employee, RestLogEntry, DailyHabit, RoutineStep } from '../types';
-import { Users, Clock, CheckCircle2, Share2, Calendar } from 'lucide-react';
-
-interface ReportsAnalyticsViewProps {
-  habits: DailyHabit[];
-  routineSteps: RoutineStep[];
-}
+import { Employee, RestLogEntry } from '../types';
+import { sanitizeAndRepairEmployees } from '../utils/timeMath';
+import { Users, Clock, Share2 } from 'lucide-react';
 
 const STORAGE_KEYS = {
   EMPLOYEES: 'miqat_rest_employees_v1',
   LOGS: 'miqat_rest_logs_v1',
 };
 
-export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
-  habits,
-  routineSteps,
-}) => {
+export const ReportsAnalyticsView: React.FC = () => {
   const [periodTab, setPeriodTab] = useState<'day' | 'week' | 'month'>('day');
   const [copiedNotice, setCopiedNotice] = useState(false);
 
   const employees: Employee[] = useMemo(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
-      return raw ? JSON.parse(raw) : [];
+      const parsed = raw ? JSON.parse(raw) : [];
+      return sanitizeAndRepairEmployees(parsed).employees;
     } catch {
       return [];
     }
@@ -31,7 +25,8 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
   const logs: RestLogEntry[] = useMemo(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.LOGS);
-      return raw ? JSON.parse(raw) : [];
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
     }
@@ -47,82 +42,90 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
         : now.getTime() - 30 * 24 * 3600 * 1000;
 
     return logs.filter((l) => {
-      const t = new Date(l.endedAtIso).getTime();
-      return isNaN(t) || t >= cutoffMs;
+      if (!l || typeof l !== 'object') return false;
+      const t = Date.parse(l.endedAtIso);
+      return !isNaN(t) && t >= cutoffMs;
     });
   }, [logs, periodTab]);
 
   const stats = useMemo(() => {
     const totalRests = filteredLogs.length;
     const uniqueBeneficiaries = new Set(filteredLogs.map((l) => l.employeeId)).size;
+
     const totalMinutes = filteredLogs.reduce((acc, l) => {
-      const unit = l.wasTestMode ? 1 : 60;
-      return acc + Math.round(l.actualSeconds / unit);
+      const rawSecs = Number(l.actualSeconds);
+      if (!Number.isFinite(rawSecs) || rawSecs <= 0) return acc;
+      // Legacy logs recorded with wasTestMode=true stored 1s per minute; normalized logs store 60s per minute
+      const mins =
+        l.wasTestMode && rawSecs < 240
+          ? Math.round(rawSecs)
+          : Math.max(1, Math.round(rawSecs / 60));
+      return acc + Math.min(240, mins);
     }, 0);
+
     const avgDuration =
-      totalRests > 0 ? Math.max(1, Math.round(totalMinutes / totalRests)) : 12;
+      totalRests > 0 ? Math.max(1, Math.round(totalMinutes / totalRests)) : 0;
 
     const countsMap = new Map<
       string,
       { name: string; count: number; totalMins: number; color: string }
     >();
+
     filteredLogs.forEach((l) => {
+      const empMatch = employees.find((e) => e.id === l.employeeId);
       const prev = countsMap.get(l.employeeId) || {
-        name: l.employeeName,
+        name: l.employeeName || empMatch?.name || 'موظف',
         count: 0,
         totalMins: 0,
-        color: '#2F80ED',
+        color: empMatch?.avatarColor || '#2F80ED',
       };
-      const unit = l.wasTestMode ? 1 : 60;
+      const rawSecs = Number(l.actualSeconds);
+      const mins =
+        Number.isFinite(rawSecs) && rawSecs > 0
+          ? l.wasTestMode && rawSecs < 240
+            ? Math.round(rawSecs)
+            : Math.max(1, Math.round(rawSecs / 60))
+          : 0;
       countsMap.set(l.employeeId, {
-        name: l.employeeName,
+        name: prev.name,
         count: prev.count + 1,
-        totalMins: prev.totalMins + Math.round(l.actualSeconds / unit),
+        totalMins: prev.totalMins + Math.min(240, mins),
         color: prev.color,
       });
     });
 
     if (countsMap.size === 0 && employees.length > 0) {
-      employees.slice(0, 4).forEach((emp, i) => {
+      employees.forEach((emp) => {
+        const consumedMins = Math.max(0, Math.round((emp.consumedSecondsToday || 0) / 60));
         countsMap.set(emp.id, {
           name: emp.name,
-          count: emp.hasStartedRestToday ? 2 : i === 0 ? 3 : 2,
-          totalMins: Math.round(emp.consumedSecondsToday / 60) || 15,
+          count: emp.hasStartedRestToday || consumedMins > 0 ? 1 : 0,
+          totalMins: consumedMins,
           color: emp.avatarColor || '#2F80ED',
         });
       });
     }
 
     const leaderboard = Array.from(countsMap.values()).sort(
-      (a, b) => b.count - a.count
+      (a, b) => b.count - a.count || b.totalMins - a.totalMins
     );
 
     return {
-      totalRests: totalRests || 5,
-      uniqueBeneficiaries:
-        uniqueBeneficiaries ||
-        employees.filter((e) => e.hasStartedRestToday).length ||
-        employees.length,
+      totalRests,
+      uniqueBeneficiaries,
       avgDuration,
       leaderboard,
     };
   }, [filteredLogs, employees]);
-
-  const completedHabitsToday = habits.filter((h) =>
-    h.completedDates.includes(new Date().toISOString().slice(0, 10))
-  ).length;
-  const completedRoutineCount = routineSteps.filter((s) => s.completed).length;
 
   const handleShareSummary = async () => {
     const periodLabel =
       periodTab === 'day' ? 'اليوم' : periodTab === 'week' ? 'الأسبوع' : 'الشهر';
     const text = [
       `📊 تقرير تطبيق SmartMorning — ميقات الفجر (${periodLabel})`,
-      `• إجمالي الاستراحات: ${stats.totalRests}`,
+      `• إجمالي الاستراحات المسجلة: ${stats.totalRests}`,
       `• المستفيدون: ${stats.uniqueBeneficiaries}`,
       `• متوسط مدة الاستراحة: ${stats.avgDuration} دقيقة`,
-      `• إنجاز العادات اليومية: ${completedHabitsToday} من ${habits.length}`,
-      `• إنجاز الروتين الصباحي: ${completedRoutineCount} من ${routineSteps.length}`,
     ].join('\n');
 
     if (navigator.share) {
@@ -140,7 +143,7 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
 
   return (
     <div className="space-y-5">
-      {/* Top Header matching Reference Screen 12 */}
+      {/* Top Header */}
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold text-[#172B4D]">التقارير</h2>
 
@@ -153,7 +156,7 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
         </button>
       </div>
 
-      {/* Period Segmented Tabs: اليوم | الأسبوع | الشهر (Screen 12) */}
+      {/* Period Segmented Tabs: اليوم | الأسبوع | الشهر */}
       <div className="grid grid-cols-3 gap-1.5 p-1.5 bg-[#E6EDF5] rounded-2xl max-w-md">
         <button
           onClick={() => setPeriodTab('day')}
@@ -187,7 +190,7 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
         </button>
       </div>
 
-      {/* 3 White KPI Cards matching Reference Screen 12 */}
+      {/* 3 White KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="sm-card p-5 flex items-center justify-between">
           <div className="w-12 h-12 rounded-2xl bg-[#E6F8EF] text-[#10B981] flex items-center justify-center shrink-0">
@@ -232,78 +235,61 @@ export const ReportsAnalyticsView: React.FC<ReportsAnalyticsViewProps> = ({
         </div>
       </div>
 
-      {/* Most Active Employees Leaderboard Card (Screen 12) */}
+      {/* Most Active Employees Leaderboard Card */}
       <div className="sm-card p-6 space-y-4">
         <h3 className="text-base font-bold text-[#172B4D]">
-          أكثر الموظفين استخداماً للاستراحات
+          استخدام الموظفين للاستراحات
         </h3>
 
-        <div className="space-y-4">
-          {stats.leaderboard.map((item, idx) => {
-            const maxCount = Math.max(1, stats.leaderboard[0]?.count || 1);
-            const widthPct = Math.max(18, Math.round((item.count / maxCount) * 100));
-            return (
-              <div key={idx} className="flex items-center justify-between gap-4">
-                {/* Right side in RTL: Avatar Circle + Name */}
-                <div className="flex items-center gap-3 min-w-[130px]">
-                  <div
-                    style={{ backgroundColor: item.color || '#1B365D' }}
-                    className="w-9 h-9 rounded-full text-white font-bold text-xs flex items-center justify-center shrink-0"
-                  >
-                    {item.name.slice(0, 1)}
+        {stats.leaderboard.length === 0 ? (
+          <p className="text-xs text-[#6B7C93] py-4 text-center">
+            لا توجد بيانات استراحات مسجلة في هذه الفترة بعد.
+          </p>
+        ) : (
+          <div className="space-y-4">
+            {stats.leaderboard.map((item, idx) => {
+              const maxCount = Math.max(1, stats.leaderboard[0]?.count || 1);
+              const widthPct =
+                item.count > 0
+                  ? Math.max(15, Math.round((item.count / maxCount) * 100))
+                  : 0;
+              return (
+                <div key={idx} className="flex items-center justify-between gap-4">
+                  {/* Right side in RTL: Avatar Circle + Name */}
+                  <div className="flex items-center gap-3 min-w-[140px]">
+                    <div
+                      style={{ backgroundColor: item.color || '#1B365D' }}
+                      className="w-9 h-9 rounded-full text-white font-bold text-xs flex items-center justify-center shrink-0"
+                    >
+                      {item.name.slice(0, 1)}
+                    </div>
+                    <div>
+                      <span className="text-xs font-bold text-[#172B4D] block truncate">
+                        {item.name}
+                      </span>
+                      <span className="text-[11px] text-[#6B7C93] font-mono">
+                        {item.totalMins} دقيقة
+                      </span>
+                    </div>
                   </div>
-                  <span className="text-xs font-bold text-[#172B4D] truncate">
-                    {item.name}
+
+                  {/* Middle: Progress Bar */}
+                  <div className="flex-1 h-2.5 bg-[#F0F4F9] rounded-full overflow-hidden">
+                    <div
+                      style={{ width: `${widthPct}%` }}
+                      className="h-full bg-[#2F80ED] rounded-full transition-all"
+                    />
+                  </div>
+
+                  {/* Left: Count */}
+                  <span className="font-mono tabular-nums text-xs font-bold text-[#6B7C93] w-8 text-left">
+                    {item.count}
                   </span>
                 </div>
-
-                {/* Middle: Progress Bar */}
-                <div className="flex-1 h-2.5 bg-[#F0F4F9] rounded-full overflow-hidden">
-                  <div
-                    style={{ width: `${widthPct}%` }}
-                    className="h-full bg-[#2F80ED] rounded-full transition-all"
-                  />
-                </div>
-
-                {/* Left: Count */}
-                <span className="font-mono tabular-nums text-xs font-bold text-[#6B7C93] w-6 text-left">
-                  {item.count}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Habits & Routine Completion Summary */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="sm-card p-5 flex items-center justify-between">
-          <div>
-            <span className="text-xs text-[#6B7C93] font-semibold block">
-              إنجاز العادات اليومية
-            </span>
-            <span className="text-lg font-bold text-[#172B4D]">
-              {completedHabitsToday} من {habits.length} عادات
-            </span>
+              );
+            })}
           </div>
-          <div className="w-10 h-10 rounded-xl bg-[#E6F8EF] text-[#10B981] flex items-center justify-center">
-            <Calendar className="w-5 h-5" />
-          </div>
-        </div>
-
-        <div className="sm-card p-5 flex items-center justify-between">
-          <div>
-            <span className="text-xs text-[#6B7C93] font-semibold block">
-              إنجاز الروتين الصباحي
-            </span>
-            <span className="text-lg font-bold text-[#172B4D]">
-              {completedRoutineCount} من {routineSteps.length} أنشطة
-            </span>
-          </div>
-          <div className="w-10 h-10 rounded-xl bg-[#FFF4E5] text-[#F59E0B] flex items-center justify-center">
-            <CheckCircle2 className="w-5 h-5" />
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

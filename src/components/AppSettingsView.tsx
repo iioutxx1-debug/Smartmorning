@@ -1,7 +1,21 @@
-import React, { useState } from 'react';
-import { SoundType } from '../types';
+import React, { useState, useEffect } from 'react';
+import {
+  SoundType,
+  SoundSourceType,
+  DefaultToneConfig,
+  ImportedSongItem,
+  AlarmItem,
+} from '../types';
 import { SOUND_OPTIONS } from '../data/presets';
 import { soundEngine } from '../utils/soundEngine';
+import { nativeAlarmBridge } from '../utils/nativeAlarmBridge';
+import {
+  getImportedSongs,
+  importSongFromDevice,
+  deleteImportedSongFromLibrary,
+  formatBytesArabic,
+  formatSecondsMMSS,
+} from '../utils/audioLibraryStore';
 import { SmartMorningIcon } from './SmartMorningIcon';
 import {
   Volume2,
@@ -12,48 +26,176 @@ import {
   HelpCircle,
   Info,
   Play,
+  Square,
   Download,
   Upload,
   RotateCcw,
   ChevronLeft,
   ChevronRight,
-  Search,
+  Smartphone,
+  Music,
+  Trash2,
+  AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 
 interface AppSettingsViewProps {
   themeMode: 'dark' | 'light';
   onToggleTheme: () => void;
-  defaultRingtone: SoundType;
-  onChangeDefaultRingtone: (sound: SoundType) => void;
+  defaultToneConfig: DefaultToneConfig;
+  onChangeDefaultToneConfig: (config: DefaultToneConfig) => void;
+  allAlarms?: AlarmItem[];
+  onSongDeletedFromLibrary?: (deletedSongId: string, deletedSongName: string) => void;
   onResetAllData: () => void;
 }
 
 export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
   themeMode,
   onToggleTheme,
-  defaultRingtone,
-  onChangeDefaultRingtone,
+  defaultToneConfig,
+  onChangeDefaultToneConfig,
+  allAlarms = [],
+  onSongDeletedFromLibrary,
   onResetAllData,
 }) => {
   const [subScreen, setSubScreen] = useState<
     'main' | 'sound' | 'ringtones' | 'storage' | 'help' | 'about'
   >('main');
-  const [ringtoneTab, setRingtoneTab] = useState<'app_tones' | 'phone_tones'>('app_tones');
-  const [searchTone, setSearchTone] = useState('');
+  const [ringtoneTab, setRingtoneTab] = useState<SoundSourceType>(
+    defaultToneConfig.soundSource || 'app_tone'
+  );
+  const [songs, setSongs] = useState<ImportedSongItem[]>(() => getImportedSongs());
+  const [previewingKey, setPreviewingKey] = useState<string | null>(null);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+  const [deletingSong, setDeletingSong] = useState<ImportedSongItem | null>(null);
+
   const [volumeLevel, setVolumeLevel] = useState(85);
   const [vibrationEnabled, setVibrationEnabled] = useState(true);
   const [confirmResetModal, setConfirmResetModal] = useState(false);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
 
-  const phoneStandardTones: { id: SoundType; title: string; subtitle: string }[] = [
-    { id: 'fajr_adhan_tone', title: 'Ringtone 1', subtitle: 'نغمة شروق الصباح الهادئة' },
-    { id: 'makkah_tone', title: 'Ringtone 2', subtitle: 'ترددات روحانية صافية' },
-    { id: 'dawn_chimes', title: 'Ringtone 3', subtitle: 'أجراس الصباح الكلاسيكية' },
-    { id: 'nature_birds', title: 'Ringtone 4', subtitle: 'أصوات عصافير الصباح' },
-    { id: 'calm_piano', title: 'Ringtone 5', subtitle: 'بيانو هادئ للاستيقاظ' },
-    { id: 'zen_bowl', title: 'Ringtone 6', subtitle: 'رنين متوازن مريح' },
-    { id: 'classic_pulse', title: 'Ringtone 7', subtitle: 'منبه رقمي واضح' },
-  ];
+  useEffect(() => {
+    setSongs(getImportedSongs());
+  }, [subScreen]);
+
+  const getDefaultToneTitle = (): string => {
+    if (defaultToneConfig.soundSource === 'phone_ringtone' && defaultToneConfig.customSoundUri) {
+      return defaultToneConfig.customSoundTitle || 'نغمة منبه الهاتف';
+    }
+    if (defaultToneConfig.soundSource === 'my_song') {
+      const matched = songs.find(
+        (s) =>
+          s.id === defaultToneConfig.customSongId ||
+          s.uri === defaultToneConfig.customSoundUri
+      );
+      return matched?.name || defaultToneConfig.customSoundTitle || 'أغنية مخصصة';
+    }
+    return (
+      SOUND_OPTIONS.find((s) => s.id === defaultToneConfig.sound)?.name ||
+      'نداء الفجر الهادئ'
+    );
+  };
+
+  const handlePickAndroidRingtone = async () => {
+    setPickerError(null);
+    soundEngine.stop();
+    setPreviewingKey(null);
+
+    const res = await nativeAlarmBridge.pickSystemAlarmRingtone(
+      defaultToneConfig.soundSource === 'phone_ringtone'
+        ? defaultToneConfig.customSoundUri
+        : undefined
+    );
+
+    if (res.cancelled) return;
+    if (res.error || !res.uri) {
+      setPickerError(res.error || 'تعذر فتح منتقي نغمات أندرويد.');
+      return;
+    }
+
+    onChangeDefaultToneConfig({
+      soundSource: 'phone_ringtone',
+      sound: defaultToneConfig.sound,
+      customSoundUri: res.uri,
+      customSoundTitle: res.title || 'نغمة منبه الهاتف',
+      customSongId: undefined,
+    });
+    setStatusNotice(`تم اختيار نغمة الهاتف الافتراضية: «${res.title || 'نغمة النظام'}»`);
+  };
+
+  const handleImportSongInSettings = async () => {
+    setPickerError(null);
+    soundEngine.stop();
+    setPreviewingKey(null);
+
+    const res = await importSongFromDevice();
+    if (res.cancelled) return;
+    if (res.error || !res.song) {
+      setPickerError(res.error || 'تعذر استيراد الأغنية المختارة.');
+      return;
+    }
+
+    setSongs(getImportedSongs());
+    onChangeDefaultToneConfig({
+      soundSource: 'my_song',
+      sound: defaultToneConfig.sound,
+      customSoundUri: res.song.uri,
+      customSoundTitle: res.song.name,
+      customSongId: res.song.id,
+    });
+    setStatusNotice(`تمت إضافة «${res.song.name}» إلى «أغنياتي» وتعيينها كنغمة افتراضية.`);
+  };
+
+  const handleTogglePreview = async (
+    key: string,
+    opts: {
+      soundSource: SoundSourceType;
+      sound: SoundType;
+      customSoundUri?: string;
+      customSongId?: string;
+    }
+  ) => {
+    setPickerError(null);
+    if (previewingKey === key) {
+      soundEngine.stop();
+      setPreviewingKey(null);
+      return;
+    }
+
+    setPreviewingKey(key);
+    const res = await soundEngine.playCustomSourcePreview(opts);
+    if (!res.ok) {
+      setPreviewingKey(null);
+      setPickerError(res.error || 'تعذر تشغيل المعاينة الصوتية.');
+    }
+  };
+
+  const handleConfirmDeleteSong = async () => {
+    if (!deletingSong) return;
+    const target = deletingSong;
+    soundEngine.stop();
+    setPreviewingKey(null);
+
+    await deleteImportedSongFromLibrary(target.id);
+    setSongs(getImportedSongs());
+    setDeletingSong(null);
+
+    if (
+      defaultToneConfig.soundSource === 'my_song' &&
+      (defaultToneConfig.customSongId === target.id ||
+        defaultToneConfig.customSoundUri === target.uri)
+    ) {
+      onChangeDefaultToneConfig({
+        soundSource: 'app_tone',
+        sound: 'fajr_adhan_tone',
+      });
+    }
+
+    if (onSongDeletedFromLibrary) {
+      onSongDeletedFromLibrary(target.id, target.name);
+    }
+    setStatusNotice(`تم حذف «${target.name}» من مكتبة التطبيق بأمان.`);
+  };
 
   const handleExportAll = () => {
     const payload: Record<string, unknown> = {};
@@ -100,6 +242,14 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
     reader.readAsText(file);
   };
 
+  const alarmsUsingDeletingSong = deletingSong
+    ? allAlarms.filter(
+        (a) =>
+          a.soundSource === 'my_song' &&
+          (a.customSongId === deletingSong.id || a.customSoundUri === deletingSong.uri)
+      )
+    : [];
+
   return (
     <div className="max-w-2xl mx-auto space-y-5">
       {statusNotice && (
@@ -115,7 +265,7 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
       )}
 
       {/* =====================================================
-          MAIN SETTINGS LIST (Reference Screen 13)
+          MAIN SETTINGS LIST
          ===================================================== */}
       {subScreen === 'main' && (
         <div className="space-y-4">
@@ -139,7 +289,7 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
               <ChevronLeft className="w-4 h-4 text-[#6B7C93]" />
             </button>
 
-            {/* Row 2: نغمات الرنين */}
+            {/* Row 2: نغمات الرنين وأغنياتي */}
             <button
               type="button"
               onClick={() => setSubScreen('ringtones')}
@@ -150,14 +300,12 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
                   <Bell className="w-5 h-5" />
                 </div>
                 <span className="text-sm font-bold text-[#172B4D]">
-                  نغمات الرنين
+                  نغمات الرنين وأغنياتي
                 </span>
               </div>
               <div className="flex items-center gap-2 text-xs text-[#6B7C93]">
-                <span>
-                  {SOUND_OPTIONS.find((s) => s.id === defaultRingtone)?.name}
-                </span>
-                <ChevronLeft className="w-4 h-4" />
+                <span className="truncate max-w-[160px]">{getDefaultToneTitle()}</span>
+                <ChevronLeft className="w-4 h-4 shrink-0" />
               </div>
             </button>
 
@@ -248,7 +396,7 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
       )}
 
       {/* =====================================================
-          SUB-SCREEN: RINGTONES (Screens 5 & 6)
+          SUB-SCREEN: RINGTONES & MY SONGS (3 Independent Sources)
          ===================================================== */}
       {subScreen === 'ringtones' && (
         <div className="sm-card p-5 sm:p-6 space-y-5">
@@ -257,6 +405,7 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
               type="button"
               onClick={() => {
                 soundEngine.stop();
+                setPreviewingKey(null);
                 setSubScreen('main');
               }}
               className="min-h-[38px] px-2.5 rounded-xl hover:bg-slate-100 text-[#172B4D] flex items-center gap-1 text-xs font-bold cursor-pointer"
@@ -265,121 +414,268 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
               <span>رجوع</span>
             </button>
             <h3 className="text-lg font-bold text-[#172B4D]">
-              {ringtoneTab === 'app_tones' ? 'إختيار نغمة الرنين' : 'نغمات الهاتف'}
+              نغمات الرنين وأغنياتي
             </h3>
             <div className="w-12" />
           </div>
 
-          <div className="grid grid-cols-2 gap-1.5 p-1.5 bg-[#E6EDF5] rounded-2xl">
+          {/* 3 Independent Tabs: نغمات التطبيق | نغمات الهاتف | أغنياتي */}
+          <div className="grid grid-cols-3 gap-1.5 p-1.5 bg-[#E6EDF5] rounded-2xl">
             <button
-              onClick={() => setRingtoneTab('app_tones')}
+              type="button"
+              onClick={() => {
+                soundEngine.stop();
+                setPreviewingKey(null);
+                setPickerError(null);
+                setRingtoneTab('app_tone');
+              }}
               className={`min-h-[40px] rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                ringtoneTab === 'app_tones'
-                  ? 'bg-[#D8E8FC] text-[#1B365D] shadow-xs'
+                ringtoneTab === 'app_tone'
+                  ? 'bg-[#1B365D] text-white shadow-xs'
                   : 'text-[#6B7C93]'
               }`}
             >
               نغمات التطبيق
             </button>
+
             <button
-              onClick={() => setRingtoneTab('phone_tones')}
+              type="button"
+              onClick={() => {
+                soundEngine.stop();
+                setPreviewingKey(null);
+                setPickerError(null);
+                setRingtoneTab('phone_ringtone');
+                if (nativeAlarmBridge.isNativeAndroid()) {
+                  handlePickAndroidRingtone();
+                }
+              }}
               className={`min-h-[40px] rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                ringtoneTab === 'phone_tones'
-                  ? 'bg-[#D8E8FC] text-[#1B365D] shadow-xs'
+                ringtoneTab === 'phone_ringtone'
+                  ? 'bg-[#1B365D] text-white shadow-xs'
                   : 'text-[#6B7C93]'
               }`}
             >
-              من الهاتف
+              نغمات الهاتف
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                soundEngine.stop();
+                setPreviewingKey(null);
+                setPickerError(null);
+                setRingtoneTab('my_song');
+              }}
+              className={`min-h-[40px] rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                ringtoneTab === 'my_song'
+                  ? 'bg-[#1B365D] text-white shadow-xs'
+                  : 'text-[#6B7C93]'
+              }`}
+            >
+              أغنياتي ({songs.length})
             </button>
           </div>
 
-          {ringtoneTab === 'phone_tones' && (
-            <div className="relative">
-              <input
-                type="text"
-                placeholder="البحث عن نغمة..."
-                value={searchTone}
-                onChange={(e) => setSearchTone(e.target.value)}
-                className="w-full min-h-[44px] sm-input px-4 pl-10 text-xs"
-              />
-              <Search className="w-4 h-4 text-[#6B7C93] absolute left-3.5 top-1/2 -translate-y-1/2" />
+          {pickerError && (
+            <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-bold space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{pickerError}</span>
+              </div>
+              {ringtoneTab === 'phone_ringtone' && (
+                <button
+                  type="button"
+                  onClick={handlePickAndroidRingtone}
+                  className="min-h-[34px] px-3 py-1 rounded-xl bg-rose-600 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>المحاولة مجدداً</span>
+                </button>
+              )}
             </div>
           )}
 
-          <div className="space-y-2.5">
-            {ringtoneTab === 'app_tones'
-              ? SOUND_OPTIONS.map((tone) => {
-                  const selected = defaultRingtone === tone.id;
-                  return (
-                    <div
-                      key={tone.id}
-                      onClick={() => {
-                        onChangeDefaultRingtone(tone.id);
-                        soundEngine.playPreview(tone.id);
-                      }}
-                      className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 cursor-pointer transition-all ${
-                        selected
-                          ? 'bg-[#E3EFFD] border-[#2F80ED]/50'
-                          : 'bg-white border-[#E6EDF5] hover:border-[#CBD5E1]'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
-                            selected
-                              ? 'border-[#2F80ED] bg-[#2F80ED]'
-                              : 'border-[#CBD5E1] bg-white'
-                          }`}
-                        >
-                          {selected && (
-                            <span className="w-2 h-2 rounded-full bg-white block" />
-                          )}
-                        </div>
-                        <div>
-                          <div className="text-sm font-bold text-[#172B4D]">
-                            {tone.name}
-                          </div>
-                          <div className="text-[11px] text-[#6B7C93]">{tone.desc}</div>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          soundEngine.playPreview(tone.id);
-                        }}
-                        className="w-9 h-9 rounded-xl bg-[#EBF3FE] text-[#2F80ED] flex items-center justify-center cursor-pointer"
+          {ringtoneTab === 'app_tone' && (
+            <div className="space-y-2.5">
+              {SOUND_OPTIONS.map((tone) => {
+                const selected =
+                  defaultToneConfig.soundSource === 'app_tone' &&
+                  defaultToneConfig.sound === tone.id;
+                const isPreviewing = previewingKey === `settings_app_${tone.id}`;
+                return (
+                  <div
+                    key={tone.id}
+                    onClick={() => {
+                      onChangeDefaultToneConfig({
+                        soundSource: 'app_tone',
+                        sound: tone.id,
+                      });
+                      handleTogglePreview(`settings_app_${tone.id}`, {
+                        soundSource: 'app_tone',
+                        sound: tone.id,
+                      });
+                    }}
+                    className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 cursor-pointer transition-all ${
+                      selected
+                        ? 'bg-[#E3EFFD] border-[#2F80ED]/50'
+                        : 'bg-white border-[#E6EDF5] hover:border-[#CBD5E1]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
+                          selected
+                            ? 'border-[#2F80ED] bg-[#2F80ED]'
+                            : 'border-[#CBD5E1] bg-white'
+                        }`}
                       >
-                        <Play className="w-4 h-4 fill-current" />
-                      </button>
+                        {selected && (
+                          <span className="w-2 h-2 rounded-full bg-white block" />
+                        )}
+                      </div>
+                      <div>
+                        <div className="text-sm font-bold text-[#172B4D]">
+                          {tone.name}
+                        </div>
+                        <div className="text-[11px] text-[#6B7C93]">{tone.desc}</div>
+                      </div>
                     </div>
-                  );
-                })
-              : phoneStandardTones
-                  .filter(
-                    (t) =>
-                      t.title.toLowerCase().includes(searchTone.toLowerCase()) ||
-                      t.subtitle.includes(searchTone)
-                  )
-                  .map((tone, idx) => {
-                    const selected = defaultRingtone === tone.id;
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleTogglePreview(`settings_app_${tone.id}`, {
+                          soundSource: 'app_tone',
+                          sound: tone.id,
+                        });
+                      }}
+                      className="w-9 h-9 rounded-xl bg-[#EBF3FE] text-[#2F80ED] flex items-center justify-center cursor-pointer"
+                    >
+                      {isPreviewing ? (
+                        <Square className="w-4 h-4 fill-current" />
+                      ) : (
+                        <Play className="w-4 h-4 fill-current" />
+                      )}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {ringtoneTab === 'phone_ringtone' && (
+            <div className="p-5 rounded-2xl bg-[#F4F7FB] border border-[#E6EDF5] space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="w-11 h-11 rounded-2xl bg-[#EBF3FE] text-[#2F80ED] flex items-center justify-center shrink-0">
+                  <Smartphone className="w-6 h-6" />
+                </div>
+                <div className="space-y-1">
+                  <h4 className="text-sm font-bold text-[#172B4D]">
+                    منتقي نغمات منبه أندرويد الحقيقي
+                  </h4>
+                  <p className="text-xs text-[#6B7C93] leading-relaxed">
+                    يفتح منتقي نغمات النظام (<span className="font-mono">RingtoneManager</span>) لاختيار نغمة منبه افتراضية من هاتفك.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handlePickAndroidRingtone}
+                className="w-full min-h-[48px] sm-btn-navy text-xs sm:text-sm flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Bell className="w-4 h-4 text-amber-300" />
+                <span>فتح منتقي نغمات الهاتف (Android)</span>
+              </button>
+
+              {defaultToneConfig.soundSource === 'phone_ringtone' &&
+                defaultToneConfig.customSoundUri && (
+                  <div className="p-3.5 rounded-2xl bg-white border border-[#2F80ED]/40 flex items-center justify-between gap-3">
+                    <div className="truncate">
+                      <span className="text-[11px] font-bold text-[#2F80ED] block">
+                        نغمة الهاتف الافتراضية الحالية:
+                      </span>
+                      <span className="text-sm font-extrabold text-[#172B4D] truncate block">
+                        {defaultToneConfig.customSoundTitle || 'نغمة النظام'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleTogglePreview('settings_phone', {
+                          soundSource: 'phone_ringtone',
+                          sound: defaultToneConfig.sound,
+                          customSoundUri: defaultToneConfig.customSoundUri,
+                        })
+                      }
+                      className="min-h-[36px] px-3 rounded-xl bg-[#1B365D] text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      {previewingKey === 'settings_phone' ? (
+                        <>
+                          <Square className="w-3.5 h-3.5 fill-current" />
+                          <span>إيقاف</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-3.5 h-3.5 fill-current" />
+                          <span>معاينة</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+            </div>
+          )}
+
+          {ringtoneTab === 'my_song' && (
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={handleImportSongInSettings}
+                className="w-full min-h-[48px] rounded-2xl bg-[#2F80ED] hover:bg-[#1B365D] text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 cursor-pointer transition-colors"
+              >
+                <Upload className="w-4 h-4" />
+                <span>إضافة أغنية من الهاتف</span>
+              </button>
+
+              {songs.length === 0 ? (
+                <div className="p-6 rounded-2xl bg-[#F4F7FB] border border-[#E6EDF5] text-center space-y-2">
+                  <Music className="w-8 h-8 text-[#9AA5B1] mx-auto" />
+                  <p className="text-xs font-bold text-[#172B4D]">
+                    لا توجد أغاني مستوردة في «أغنياتي» بعد
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {songs.map((songItem) => {
+                    const selected =
+                      defaultToneConfig.soundSource === 'my_song' &&
+                      (defaultToneConfig.customSongId === songItem.id ||
+                        defaultToneConfig.customSoundUri === songItem.uri);
+                    const isPreviewing = previewingKey === `settings_song_${songItem.id}`;
+
                     return (
                       <div
-                        key={idx}
-                        onClick={() => {
-                          onChangeDefaultRingtone(tone.id);
-                          soundEngine.playPreview(tone.id);
-                        }}
+                        key={songItem.id}
+                        onClick={() =>
+                          onChangeDefaultToneConfig({
+                            soundSource: 'my_song',
+                            sound: defaultToneConfig.sound,
+                            customSoundUri: songItem.uri,
+                            customSoundTitle: songItem.name,
+                            customSongId: songItem.id,
+                          })
+                        }
                         className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 cursor-pointer transition-all ${
                           selected
-                            ? 'bg-[#E3EFFD] border-[#2F80ED]/50'
+                            ? 'bg-[#E3EFFD] border-[#2F80ED]/60'
                             : 'bg-white border-[#E6EDF5] hover:border-[#CBD5E1]'
                         }`}
                       >
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
                           <div
-                            className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
+                            className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
                               selected
                                 ? 'border-[#2F80ED] bg-[#2F80ED]'
                                 : 'border-[#CBD5E1] bg-white'
@@ -389,31 +685,99 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
                               <span className="w-2 h-2 rounded-full bg-white block" />
                             )}
                           </div>
-                          <div>
-                            <div className="text-sm font-bold text-[#172B4D]" dir="ltr">
-                              {tone.title}
-                            </div>
-                            <div className="text-[11px] text-[#6B7C93]">
-                              {tone.subtitle}
-                            </div>
+                          <div className="min-w-0">
+                            <p className="text-sm font-bold text-[#172B4D] truncate">
+                              {songItem.name}
+                            </p>
+                            <p className="text-[11px] text-[#6B7C93]">
+                              {formatSecondsMMSS(songItem.durationSeconds)} ·{' '}
+                              {formatBytesArabic(songItem.sizeBytes)}
+                            </p>
                           </div>
                         </div>
 
-                        <Play className="w-4 h-4 text-[#2F80ED] fill-current" />
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleTogglePreview(`settings_song_${songItem.id}`, {
+                                soundSource: 'my_song',
+                                sound: defaultToneConfig.sound,
+                                customSongId: songItem.id,
+                                customSoundUri: songItem.uri,
+                              });
+                            }}
+                            className="w-9 h-9 rounded-xl bg-[#EBF3FE] text-[#2F80ED] flex items-center justify-center cursor-pointer"
+                          >
+                            {isPreviewing ? (
+                              <Square className="w-4 h-4 fill-current" />
+                            ) : (
+                              <Play className="w-4 h-4 fill-current" />
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDeletingSong(songItem);
+                            }}
+                            className="w-9 h-9 rounded-xl bg-[#F0F4F9] text-[#6B7C93] hover:text-rose-600 flex items-center justify-center cursor-pointer"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
-          </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {deletingSong && (
+            <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 space-y-3">
+              <p className="text-xs font-extrabold text-rose-900">
+                تأكيد حذف «{deletingSong.name}» من مكتبة التطبيق؟
+              </p>
+              <p className="text-[11px] text-rose-700 leading-relaxed">
+                • لن يُحذف الملف الأصلي من ذاكرة الهاتف.
+                {alarmsUsingDeletingSong.length > 0 && (
+                  <span className="block mt-1 font-bold">
+                    • سيتم تحديث ({alarmsUsingDeletingSong.length}) منبه مرتبط بهذه الأغنية إلى النغمة الاحتياطية الآمنة «نداء الفجر الهادئ».
+                  </span>
+                )}
+              </p>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDeletingSong(null)}
+                  className="min-h-[36px] px-3.5 rounded-xl bg-white text-[#172B4D] text-xs font-bold cursor-pointer"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDeleteSong}
+                  className="min-h-[36px] px-4 rounded-xl bg-rose-600 text-white text-xs font-bold cursor-pointer"
+                >
+                  تأكيد الحذف
+                </button>
+              </div>
+            </div>
+          )}
 
           <button
             type="button"
             onClick={() => {
               soundEngine.stop();
+              setPreviewingKey(null);
               setSubScreen('main');
             }}
             className="w-full min-h-[50px] sm-btn-navy text-sm flex items-center justify-center cursor-pointer"
           >
-            {ringtoneTab === 'app_tones' ? 'تأكيد' : 'استخدام'}
+            تأكيد وحفظ
           </button>
         </div>
       )}
@@ -491,7 +855,7 @@ export const AppSettingsView: React.FC<AppSettingsViewProps> = ({
           </div>
 
           <p className="text-xs text-[#6B7C93] leading-relaxed">
-            يتم حفظ جميع المنبهات والروتين الصباحي والعادات واستراحات الموظفين محلياً على جهازك دون الحاجة لأي اتصال بالإنترنت.
+            يتم حفظ جميع المنبهات والأغاني المستوردة واستراحات الموظفين وسجلات التقارير محلياً على جهازك دون الحاجة لأي اتصال بالإنترنت.
           </p>
 
           <div className="space-y-3">

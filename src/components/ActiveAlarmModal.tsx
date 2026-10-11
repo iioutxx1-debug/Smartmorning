@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { AlarmItem } from '../types';
+import { SOUND_OPTIONS } from '../data/presets';
 import { soundEngine } from '../utils/soundEngine';
-import { Sun, Volume2, CheckCircle2, Sparkles, Clock } from 'lucide-react';
+import { Sun, Volume2, CheckCircle2, Sparkles, Clock, AlertTriangle } from 'lucide-react';
 
 interface ActiveAlarmModalProps {
   alarm: AlarmItem | null;
-  onDismissAndStartRoutine: (alarm: AlarmItem) => void;
+  onDismiss: (alarm: AlarmItem) => void;
   onSnooze: (alarm: AlarmItem) => void;
 }
 
@@ -17,7 +18,7 @@ const MORNING_INTENTIONS = [
 
 export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
   alarm,
-  onDismissAndStartRoutine,
+  onDismiss,
   onSnooze,
 }) => {
   const [mathAnswer, setMathAnswer] = useState('');
@@ -25,6 +26,7 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
   const [typedIntention, setTypedIntention] = useState('');
   const [memoryTarget, setMemoryTarget] = useState<number[]>([0, 4, 8]);
   const [memorySelected, setMemorySelected] = useState<number[]>([]);
+  const [fallbackWarning, setFallbackWarning] = useState<string | null>(null);
 
   const mathProblem = useMemo(() => {
     const a = Math.floor(Math.random() * 14) + 12;
@@ -42,12 +44,14 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
   useEffect(() => {
     if (!alarm) {
       soundEngine.stop();
+      setFallbackWarning(null);
       return;
     }
 
     setMathAnswer('');
     setTypedIntention('');
     setErrorMsg('');
+    setFallbackWarning(null);
     setMemorySelected([]);
     const indices: number[] = [];
     while (indices.length < 3) {
@@ -56,7 +60,10 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
     }
     setMemoryTarget(indices);
 
-    soundEngine.startAlarmLoop(alarm.sound, alarm.gradualFadeSeconds);
+    // Play the exact alarm sound source (Phone Ringtone URI, Imported Song, or App Tone)
+    soundEngine.startAlarmItemLoop(alarm, (warning) => {
+      setFallbackWarning(warning);
+    });
 
     return () => {
       soundEngine.stop();
@@ -65,25 +72,30 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
 
   if (!alarm) return null;
 
+  const toneDisplayTitle =
+    alarm.soundSource === 'phone_ringtone' || alarm.soundSource === 'my_song'
+      ? alarm.customSoundTitle || 'نغمة مخصصة'
+      : SOUND_OPTIONS.find((s) => s.id === alarm.sound)?.name || 'نداء الفجر الهادئ';
+
   const handleVerifyChallenge = (e: React.FormEvent) => {
     e.preventDefault();
     if (alarm.challenge === 'math') {
       if (Number(mathAnswer.trim()) === mathProblem.solution) {
         soundEngine.stop();
-        onDismissAndStartRoutine(alarm);
+        onDismiss(alarm);
       } else {
         setErrorMsg('الإجابة غير صحيحة، حاول مرة أخرى لتنشيط ذهنك!');
       }
     } else if (alarm.challenge === 'intention') {
       if (typedIntention.trim().length >= 8) {
         soundEngine.stop();
-        onDismissAndStartRoutine(alarm);
+        onDismiss(alarm);
       } else {
         setErrorMsg('يرجى كتابة عبارة النية الصباحية أو الضغط على زر النسخ السريع.');
       }
     } else {
       soundEngine.stop();
-      onDismissAndStartRoutine(alarm);
+      onDismiss(alarm);
     }
   };
 
@@ -99,7 +111,7 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
     setErrorMsg('');
     if (next.length === memoryTarget.length) {
       soundEngine.stop();
-      onDismissAndStartRoutine(alarm);
+      onDismiss(alarm);
     }
   };
 
@@ -112,11 +124,11 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
             <Sun className="w-7 h-7 animate-spin" style={{ animationDuration: '14s' }} />
           </div>
 
-          <div className="flex items-center justify-center gap-2 text-xs text-sky-200 font-medium">
+          <div className="flex flex-wrap items-center justify-center gap-2 text-xs text-sky-200 font-medium">
             <Volume2 className="w-4 h-4 text-amber-300" />
-            <span>تدرج صوتي ({alarm.gradualFadeSeconds} ث)</span>
+            <span>{toneDisplayTitle}</span>
             <span aria-hidden="true">·</span>
-            <span>نافذة ذكية ({alarm.smartWindowMinutes} د)</span>
+            <span>تدرج صوتي ({alarm.gradualFadeSeconds} ث)</span>
           </div>
 
           <div className="font-mono tabular-nums text-5xl font-bold text-white tracking-tight">
@@ -125,6 +137,13 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
 
           <h2 className="text-lg font-bold text-amber-300">{alarm.label}</h2>
         </div>
+
+        {fallbackWarning && (
+          <div className="p-3 rounded-2xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-bold flex items-center gap-2 text-right">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>{fallbackWarning}</span>
+          </div>
+        )}
 
         {/* Challenge Interactive Area */}
         <div className="bg-white rounded-2xl border border-[#E6EDF5] p-5 text-right space-y-4">
@@ -163,7 +182,7 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
                 className="w-full min-h-[50px] sm-btn-navy text-sm flex items-center justify-center gap-2 cursor-pointer"
               >
                 <CheckCircle2 className="w-5 h-5" />
-                <span>تأكيد الإجابة وبدء روتين الصباح</span>
+                <span>تأكيد الإجابة وإيقاف المنبه</span>
               </button>
             </form>
           )}
@@ -207,7 +226,7 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
                 className="w-full min-h-[50px] sm-btn-navy text-sm flex items-center justify-center gap-2 cursor-pointer"
               >
                 <Sparkles className="w-5 h-5" />
-                <span>إيقاف المنبه والانطلاق للروتين</span>
+                <span>إيقاف المنبه</span>
               </button>
             </form>
           )}
@@ -252,12 +271,12 @@ export const ActiveAlarmModal: React.FC<ActiveAlarmModalProps> = ({
             <button
               onClick={() => {
                 soundEngine.stop();
-                onDismissAndStartRoutine(alarm);
+                onDismiss(alarm);
               }}
               className="w-full min-h-[50px] sm-btn-navy text-sm flex items-center justify-center gap-2 cursor-pointer"
             >
               <CheckCircle2 className="w-5 h-5" />
-              <span>إيقاف المنبه وبدء روتين الصباح</span>
+              <span>إيقاف المنبه</span>
             </button>
           )}
         </div>

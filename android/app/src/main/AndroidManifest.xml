@@ -26,6 +26,26 @@
 
         </activity>
 
+        <receiver
+            android:name=".RestAlarmReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.miqatalfajr.smartalarm.ACTION_REST_EXPIRED" />
+                <action android:name="com.miqatalfajr.smartalarm.ACTION_MARK_RETURNED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".BootRescheduleReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
