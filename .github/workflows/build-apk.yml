@@ -20,20 +20,35 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Set up Java JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
-      - name: Set up Java JDK 21 (Temurin)
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Verify Android SDK Environment & Accept Licenses
+        run: |
+          echo "=== Android SDK & Java Diagnostics ==="
+          java -version
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          which sdkmanager
+          sdkmanager --version
+          yes | sdkmanager --licenses > /dev/null
+          ls -la "${ANDROID_HOME}/platforms"
+          ls -la "${ANDROID_HOME}/build-tools"
 
       - name: Install Dependencies Cleanly (npm ci)
         run: npm ci
@@ -60,7 +75,7 @@ jobs:
 
       - name: Build Debug APK with Gradle
         working-directory: ./android
-        run: ./gradlew assembleDebug --no-daemon
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify Generated APK Exists and Check Size
         run: |

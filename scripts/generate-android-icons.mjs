@@ -212,7 +212,7 @@ const mipmapSpecs = [
   { folder: 'mipmap-xxxhdpi', launcher: 192, foreground: 432 },
 ];
 
-const resBase = path.resolve('/app/applet/android/app/src/main/res');
+const resBase = path.resolve(process.cwd(), 'android/app/src/main/res');
 
 for (const spec of mipmapSpecs) {
   const dir = path.join(resBase, spec.folder);
@@ -232,7 +232,7 @@ for (const spec of mipmapSpecs) {
 }
 
 // Also generate public web icons
-const publicDir = path.resolve('/app/applet/public');
+const publicDir = path.resolve(process.cwd(), 'public');
 fs.mkdirSync(publicDir, { recursive: true });
 fs.writeFileSync(
   path.join(publicDir, 'icon-192.png'),
