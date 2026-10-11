@@ -1,0 +1,100 @@
+@import "tailwindcss";
+
+:root {
+  --sm-bg-main: #F4F7FB;
+  --sm-bg-card: #FFFFFF;
+  --sm-bg-input: #F0F4F9;
+  --sm-border-card: #E6EDF5;
+  --sm-navy-primary: #1B365D;
+  --sm-navy-dark: #0F2342;
+  --sm-sky-accent: #2F80ED;
+  --sm-sky-soft: #EBF3FE;
+  --sm-text-primary: #172B4D;
+  --sm-text-secondary: #6B7C93;
+  --sm-text-muted: #9AA5B1;
+  --sm-success: #22C55E;
+  --sm-warning: #F59E0B;
+  --sm-danger: #EF4444;
+  --sm-purple: #8B5CF6;
+  --sm-radius-card: 1.25rem;
+  --sm-radius-control: 0.875rem;
+}
+
+.dark-theme {
+  --sm-bg-main: #0D1627;
+  --sm-bg-card: #152238;
+  --sm-bg-input: #1C2D48;
+  --sm-border-card: #243756;
+  --sm-text-primary: #F8FAFC;
+  --sm-text-secondary: #94A3B8;
+  --sm-text-muted: #64748B;
+}
+
+@layer base {
+  body {
+    font-family: 'Cairo', 'IBM Plex Sans Arabic', sans-serif;
+    background-color: var(--sm-bg-main);
+    color: var(--sm-text-primary);
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: 'Cairo', 'IBM Plex Sans Arabic', sans-serif;
+  }
+
+  .font-mono, .tabular-nums {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.sm-card {
+  background-color: var(--sm-bg-card);
+  border: 1px solid var(--sm-border-card);
+  border-radius: var(--sm-radius-card);
+  box-shadow: 0 4px 18px -2px rgba(23, 43, 77, 0.04), 0 2px 6px -1px rgba(23, 43, 77, 0.02);
+}
+
+.sm-input {
+  background-color: var(--sm-bg-input);
+  border: 1px solid var(--sm-border-card);
+  border-radius: var(--sm-radius-control);
+  color: var(--sm-text-primary);
+}
+
+.sm-input:focus {
+  outline: none;
+  border-color: var(--sm-sky-accent);
+  background-color: var(--sm-bg-card);
+  box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.14);
+}
+
+.sm-btn-navy {
+  background-color: var(--sm-navy-primary);
+  color: #FFFFFF;
+  border-radius: var(--sm-radius-control);
+  font-weight: 700;
+  transition: all 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.sm-btn-navy:hover {
+  background-color: var(--sm-navy-dark);
+}
+
+.sm-btn-navy:active {
+  transform: scale(0.985);
+}
+
+@keyframes pulse-slow {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.04);
+  }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}

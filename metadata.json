@@ -1,0 +1,6 @@
+{
+  "name": "ميقات الفجر — منبه ومنظم الروتين الصباحي الذكي",
+  "description": "تطبيق منبه ذكي بسيط وفعال لتنظيم روتين الصباح، مع حاسبة دورات النوم، والتنبيه المتدرج، وتحديات الاستيقاظ الذكية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

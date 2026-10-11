@@ -1,0 +1,297 @@
+import { AlarmItem, RoutinePreset, SmartSuggestion, SoundType, ChallengeType, DailyHabit } from '../types';
+
+export const DAY_NAMES = [
+  { index: 6, short: 'سبت', full: 'السبت' },
+  { index: 0, short: 'أحد', full: 'الأحد' },
+  { index: 1, short: 'إثنين', full: 'الإثنين' },
+  { index: 2, short: 'ثلاثاء', full: 'الثلاثاء' },
+  { index: 3, short: 'أربعاء', full: 'الأربعاء' },
+  { index: 4, short: 'خميس', full: 'الخميس' },
+  { index: 5, short: 'جمعة', full: 'الجمعة' },
+];
+
+export const SOUND_OPTIONS: { id: SoundType; name: string; desc: string }[] = [
+  { id: 'fajr_adhan_tone', name: 'نداء الفجر الهادئ', desc: 'نغمة روحانية مستوحاة من مقامات الفجر' },
+  { id: 'makkah_tone', name: 'نسيم الحرم (مقام حجاز)', desc: 'ترددات دافئة تبعث الطمأنينة والسكينة' },
+  { id: 'nature_birds', name: 'الطبيعة والعصافير', desc: 'محاكاة صوتية لإشراقة طبيعية هادئة' },
+  { id: 'dawn_chimes', name: 'موسيقى هادئة (أجراس الفجر)', desc: 'نغمات دافئة متدرجة توقظ الدماغ بلطف' },
+  { id: 'classic_pulse', name: 'نغمة محفزة (نبض رقمي)', desc: 'تنبيه إيقاعي منتظم للاستيقاظ الحاسم' },
+  { id: 'zen_bowl', name: 'موسيقى عصرية (رنين الصفاء)', desc: 'ترددات هادئة مريحة للأعصاب عند الاستيقاظ' },
+  { id: 'calm_piano', name: 'بيانو الصباح الكلاسيكي', desc: 'معزوفة بيانو ناعمة لبداية يوم متوازنة' },
+];
+
+export const INITIAL_HABITS: DailyHabit[] = [
+  {
+    id: 'hab-1',
+    title: 'الصلاة في وقتها',
+    frequency: 'يومياً',
+    iconType: 'prayer',
+    colorHex: '#F59E0B',
+    completedDates: [],
+  },
+  {
+    id: 'hab-2',
+    title: 'قراءة القرآن والأذكار',
+    frequency: 'يومياً',
+    iconType: 'quran',
+    colorHex: '#10B981',
+    completedDates: [],
+  },
+  {
+    id: 'hab-3',
+    title: 'شرب الماء (2 لتر)',
+    frequency: 'يومياً',
+    iconType: 'water',
+    colorHex: '#3B82F6',
+    completedDates: [],
+  },
+  {
+    id: 'hab-4',
+    title: 'التمارين الخفيفة والرياضة',
+    frequency: '3 مرات أسبوعياً',
+    iconType: 'sport',
+    colorHex: '#F97316',
+    completedDates: [],
+  },
+  {
+    id: 'hab-5',
+    title: 'القراءة وتطوير الذات',
+    frequency: 'يومياً',
+    iconType: 'reading',
+    colorHex: '#8B5CF6',
+    completedDates: [],
+  },
+];
+
+export const CHALLENGE_OPTIONS: { id: ChallengeType; name: string; desc: string }[] = [
+  { id: 'math', name: 'معادلة تنشيط الذهن', desc: 'حل مسألة حسابية سريعة لطرد الخمول الصباحي' },
+  { id: 'intention', name: 'تأكيد نية اليوم', desc: 'كتابة أو تأكيد عبارة تحفيزية لبدء الصباح بوعي' },
+  { id: 'memory', name: 'تسلسل الذاكرة البصرية', desc: 'تذكر ترتيب المربعات المضيئة لتنشيط التركيز' },
+  { id: 'none', name: 'إيقاف مباشر بدون تحدٍ', desc: 'إغلاق المنبه بضغطة واحدة والانتقال للروتين' },
+];
+
+export const ROUTINE_PRESETS: RoutinePreset[] = [
+  {
+    id: 'energized_45',
+    name: 'روتين النشاط والتركيز المتكامل',
+    subtitle: 'مثالي لأيام العمل والإنتاجية العالية',
+    totalMinutes: 45,
+    recommendedWakeTime: '06:00',
+    benefitText: 'يرفع مستوى اليقظة الذهنية بنسبة 40% خلال الساعة الأولى',
+    steps: [
+      {
+        id: 'step-1',
+        title: 'شرب كوبين من الماء الفاتر وترتيب السرير',
+        durationMinutes: 5,
+        category: 'health',
+        description: 'تعويض السوائل بعد النوم وإرسال إشارة إنجاز فورية للدماغ.',
+      },
+      {
+        id: 'step-2',
+        title: 'التعرض لضوء الشمس الطبيعي وتنفس عميق',
+        durationMinutes: 10,
+        category: 'mindfulness',
+        description: 'ضبط الساعة البيولوجية وإيقاف إفراز هرمون الميلاتونين.',
+      },
+      {
+        id: 'step-3',
+        title: 'تمارين إطالة وتنشيط الدورة الدموية',
+        durationMinutes: 15,
+        category: 'health',
+        description: 'تحريك المفاصل والعضلات لرفع طاقة الجسم بدون إجهاد.',
+      },
+      {
+        id: 'step-4',
+        title: 'تحديد أهم 3 أولويات لليوم (بدون تصفح الهاتف)',
+        durationMinutes: 15,
+        category: 'planning',
+        description: 'كتابة المهام الأساسية قبل الانشغال بالرسائل والإشعارات.',
+      },
+    ],
+  },
+  {
+    id: 'quick_15',
+    name: 'الانطلاقة الصباحية السريعة',
+    subtitle: 'للأيام المزدحمة التي تتطلب استيقاظاً عملياً منظماً',
+    totalMinutes: 15,
+    recommendedWakeTime: '07:00',
+    benefitText: 'يمنع التوتر الصباحي ويضمن الخروج في الوقت المحدد',
+    steps: [
+      {
+        id: 'q-1',
+        title: 'ترطيب فوري وغسل الوجه بالماء البارد',
+        durationMinutes: 3,
+        category: 'health',
+        description: 'تنبيه الجهاز العصبي السريع وإنعاش الحواس.',
+      },
+      {
+        id: 'q-2',
+        title: 'حركة خفيفة وتمدد بجانب النافذة',
+        durationMinutes: 5,
+        category: 'mindfulness',
+        description: 'فك تيبس العضلات واستنشاق هواء الصباح النقي.',
+      },
+      {
+        id: 'q-3',
+        title: 'مراجعة سريعة لجدول المواعيد وأهم مهمة',
+        durationMinutes: 7,
+        category: 'planning',
+        description: 'تركيز البوصلة الذهنية على هدف واحد رئيسي لليوم.',
+      },
+    ],
+  },
+  {
+    id: 'calm_dawn_30',
+    name: 'روتين الفجر الهادئ والصفاء الذهني',
+    subtitle: 'بداية مبكرة هادئة للقراءة والتأمل والتخطيط',
+    totalMinutes: 30,
+    recommendedWakeTime: '05:15',
+    benefitText: 'يمنحك 30 دقيقة من الهدوء الصافي قبل ضجيج اليوم',
+    steps: [
+      {
+        id: 'c-1',
+        title: 'شرب الماء والوضوء أو الاستحمام الدافئ',
+        durationMinutes: 7,
+        category: 'health',
+        description: 'تجديد النشاط الجسدي والنفسي في هدوء الفجر.',
+      },
+      {
+        id: 'c-2',
+        title: 'جلسة هدوء وأذكار أو تأمل تنفسي',
+        durationMinutes: 10,
+        category: 'mindfulness',
+        description: 'تصفية الذهن وبناء توازن نفسي عميق.',
+      },
+      {
+        id: 'c-3',
+        title: 'قراءة مركزة أو تدوين الأفكار الصباحية',
+        durationMinutes: 13,
+        category: 'focus',
+        description: 'تغذية العقل بأفكار ملهمة في أعلى أوقات الصفاء الذهني.',
+      },
+    ],
+  },
+];
+
+export const INITIAL_ALARMS: AlarmItem[] = [
+  {
+    id: 'alarm-fajr',
+    time: '04:32',
+    label: 'الفجر',
+    days: [0, 1, 2, 3, 4, 5, 6],
+    enabled: true,
+    smartWindowMinutes: 20,
+    gradualFadeSeconds: 60,
+    sound: 'fajr_adhan_tone',
+    challenge: 'math',
+    linkedRoutinePresetId: 'energized_45',
+    autoLaunchRoutine: true,
+  },
+  {
+    id: 'alarm-1',
+    time: '06:00',
+    label: 'منبه الإنجاز الصباحي المبكر',
+    days: [0, 1, 2, 3, 4],
+    enabled: true,
+    smartWindowMinutes: 20,
+    gradualFadeSeconds: 60,
+    sound: 'dawn_chimes',
+    challenge: 'math',
+    linkedRoutinePresetId: 'energized_45',
+    autoLaunchRoutine: true,
+  },
+  {
+    id: 'alarm-dhuhr',
+    time: '12:15',
+    label: 'الظهر (استراحة منتصف اليوم)',
+    days: [0, 1, 2, 3, 4, 5, 6],
+    enabled: false,
+    smartWindowMinutes: 10,
+    gradualFadeSeconds: 30,
+    sound: 'makkah_tone',
+    challenge: 'none',
+    linkedRoutinePresetId: 'quick_15',
+    autoLaunchRoutine: false,
+  },
+  {
+    id: 'alarm-asr',
+    time: '15:45',
+    label: 'العصر (تجديد النشاط)',
+    days: [0, 1, 2, 3, 4, 5, 6],
+    enabled: false,
+    smartWindowMinutes: 15,
+    gradualFadeSeconds: 30,
+    sound: 'nature_birds',
+    challenge: 'intention',
+    linkedRoutinePresetId: 'quick_15',
+    autoLaunchRoutine: false,
+  },
+  {
+    id: 'alarm-maghrib',
+    time: '18:12',
+    label: 'المغرب (هدوء المساء)',
+    days: [0, 1, 2, 3, 4, 5, 6],
+    enabled: false,
+    smartWindowMinutes: 15,
+    gradualFadeSeconds: 60,
+    sound: 'zen_bowl',
+    challenge: 'none',
+    linkedRoutinePresetId: 'calm_dawn_30',
+    autoLaunchRoutine: false,
+  },
+];
+
+export const SMART_SUGGESTIONS: SmartSuggestion[] = [
+  {
+    id: 'sug-90min-cycle',
+    title: 'ضبط نافذة الاستيقاظ الذكي (20 دقيقة قبل الموعد)',
+    category: 'علم دورات النوم',
+    impactMetric: 'يقلل خمول الاستيقاظ بنسبة 65%',
+    description:
+      'بدلاً من الرنين المفاجئ أثناء النوم العميق، يقوم المنبه الذكي ببدء تدرج صوتي وضوئي لطيف خلال نافذة 20 دقيقة عندما تكون في مرحلة النوم الخفيف.',
+    actionLabel: 'تفعيل النافذة الذكية (20 د) على المنبه النشط',
+    actionType: 'enable_smart_window',
+    payload: { smartWindow: 20 },
+  },
+  {
+    id: 'sug-no-phone-shield',
+    title: 'قاعدة الـ 15 دقيقة الذهبية بدون شاشات',
+    category: 'حماية الدوبامين الصباحي',
+    impactMetric: '+35% قدرة على التركيز المستمر',
+    description:
+      'تصفح الإشعارات فور الاستيقاظ يشتت انتباه الدماغ ويرفع هرمون الكورتيزول. أضف خطوة "عزل الهاتف وتحديد 3 أولويات" إلى روتينك الصباحي.',
+    actionLabel: 'إضافة خطوة حماية التركيز لروتيني الحالي',
+    actionType: 'add_habit_step',
+    payload: {
+      habitStep: {
+        id: 'habit-no-phone',
+        title: 'وضع الطيران لـ 15 دقيقة وتجهيز كوب قهوة/شاي بهدوء',
+        durationMinutes: 10,
+        category: 'focus',
+        description: 'الامتناع التام عن فتح البريد أو وسائل التواصل حتى انتهاء الروتين.',
+      },
+    },
+  },
+  {
+    id: 'sug-sunlight-anchor',
+    title: 'تثبيت الساعة البيولوجية بضوء الصباح والترطيب',
+    category: 'الطاقة الحيوية',
+    impactMetric: 'نوم أعمق ليلاً بـ 45 دقيقة',
+    description:
+      'شرب 500 مل من الماء والتعرض للضوء الطبيعي في أول 10 دقائق بعد الاستيقاظ يضبط إيقاع الكورتيزول الصباحي ويساعدك على النوم السريع في المساء.',
+    actionLabel: 'اعتماد روتين النشاط والتركيز (45 دقيقة)',
+    actionType: 'apply_routine',
+    payload: { presetId: 'energized_45' },
+  },
+  {
+    id: 'sug-early-dawn-alarm',
+    title: 'تجربة منبه الساعة الذهبية (05:30 صباحاً)',
+    category: 'تطوير العادات',
+    impactMetric: 'ساعة صافية للإنجاز الشخصي يومياً',
+    description:
+      'اقتراح لإضافة منبه مبكر مع تحدي تنشيط الذهن وتدرج صوتي لمدة 60 ثانية لمنحك وقتاً هادئاً للقراءة أو الرياضة قبل بداية التزاماتك.',
+    actionLabel: 'إنشاء منبه الساعة الذهبية 05:30 ص',
+    actionType: 'apply_alarm',
+    payload: { time: '05:30', smartWindow: 20, presetId: 'calm_dawn_30' },
+  },
+];
